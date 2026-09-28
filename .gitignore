@@ -1,0 +1,11 @@
+# Build artifacts
+build/
+out/
+*.log
+
+# Editors
+.vs/
+.vscode/
+CMakeSettings.json
+CMakeCache.txt
+CMakeFiles/

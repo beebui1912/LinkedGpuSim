@@ -1,0 +1,5 @@
+LIBRARY VkLayer_DiligentGpuSim
+EXPORTS
+    vkNegotiateLoaderLayerInterfaceVersion
+    vk_layerGetInstanceProcAddr
+    vk_layerGetDeviceProcAddr
