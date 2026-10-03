@@ -49,6 +49,7 @@
 #include "LayerConfig.hpp"
 #include "LayerDispatch.hpp"
 #include "LayerLog.hpp"
+#include "PhysicalDeviceThunks.hpp"
 #include "WrappedPhysicalDevice.hpp"
 
 // Exports come from VkLayer_DiligentGpuSim.def; the function signatures below
@@ -177,7 +178,8 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreateInstance(
         return VK_ERROR_INITIALIZATION_FAILED;
     }
 
-    PFN_vkGetInstanceProcAddr pfnNextGipa = pLayerCi->u.pLayerInfo->pfnNextGetInstanceProcAddr;
+    PFN_vkGetInstanceProcAddr     pfnNextGipa  = pLayerCi->u.pLayerInfo->pfnNextGetInstanceProcAddr;
+    PFN_GetPhysicalDeviceProcAddr pfnNextGpdpa = pLayerCi->u.pLayerInfo->pfnNextGetPhysicalDeviceProcAddr;
     pLayerCi->u.pLayerInfo = pLayerCi->u.pLayerInfo->pNext;
 
     auto pfnNextCreateInstance = reinterpret_cast<PFN_vkCreateInstance>(
@@ -193,6 +195,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreateInstance(
     InstanceData d{};
     d.Instance            = *pInstance;
     d.GetInstanceProcAddr = pfnNextGipa;
+    d.GetPhysicalDeviceProcAddr = pfnNextGpdpa;
 #define GET_INST_FN(field, name) \
     d.field = reinterpret_cast<PFN_vk##field>(pfnNextGipa(*pInstance, "vk" name))
 
@@ -941,11 +944,24 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL Layer_vkGetInstanceProcAddr(VkInstance 
     ROUTE_PD(GetPhysicalDeviceWin32PresentationSupportKHR);
 #endif
 
-    // Everything else - chain to the next layer.
+    // Everything else - chain to the next layer. Physical-device functions the layer does not
+    // hook get a thunk that unwraps the simulated devices (PhysicalDeviceThunks.hpp).
     if (Instance == VK_NULL_HANDLE) return nullptr;
     InstanceData* pInst = FindInstance(Instance);
     if (pInst == nullptr || pInst->GetInstanceProcAddr == nullptr) return nullptr;
-    return pInst->GetInstanceProcAddr(Instance, pName);
+    PFN_vkVoidFunction Next = pInst->GetInstanceProcAddr(Instance, pName);
+    return IsPhysicalDeviceFunction(pName) ? MakeUnwrapThunk(Next) : Next;
+}
+
+// Loader interface 2: physical-device functions the loader does not know (extensions)
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL Layer_GetPhysicalDeviceProcAddr(VkInstance Instance, const char* pName)
+{
+    if (PFN_vkVoidFunction Own = Layer_vkGetInstanceProcAddr(VK_NULL_HANDLE, pName))
+        return Own;
+    InstanceData* pInst = FindInstance(Instance);
+    if (pInst == nullptr || pInst->GetPhysicalDeviceProcAddr == nullptr)
+        return nullptr;
+    return MakeUnwrapThunk(pInst->GetPhysicalDeviceProcAddr(Instance, pName));
 }
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL Layer_vkGetDeviceProcAddr(VkDevice Device, const char* pName)
@@ -987,7 +1003,7 @@ extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkNegotiateLoaderLayerInterfaceVersion
 
     pVersionStruct->pfnGetInstanceProcAddr        = &VkSim::Layer_vkGetInstanceProcAddr;
     pVersionStruct->pfnGetDeviceProcAddr          = &VkSim::Layer_vkGetDeviceProcAddr;
-    pVersionStruct->pfnGetPhysicalDeviceProcAddr  = nullptr;
+    pVersionStruct->pfnGetPhysicalDeviceProcAddr  = pVersionStruct->loaderLayerInterfaceVersion >= 2 ? &VkSim::Layer_GetPhysicalDeviceProcAddr : nullptr;
 
     return VK_SUCCESS;
 }

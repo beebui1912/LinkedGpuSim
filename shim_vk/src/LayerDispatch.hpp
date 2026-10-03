@@ -19,6 +19,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <vulkan/vk_layer.h>
 #include <vulkan/vulkan.h>
 
 #include "LayerMemoryModel.hpp"
@@ -39,6 +40,7 @@ struct InstanceData
 
     // Base chain
     PFN_vkGetInstanceProcAddr                   GetInstanceProcAddr                  = nullptr;
+    PFN_GetPhysicalDeviceProcAddr               GetPhysicalDeviceProcAddr            = nullptr; // loader interface 2
     PFN_vkDestroyInstance                       DestroyInstance                      = nullptr;
     PFN_vkEnumeratePhysicalDevices              EnumeratePhysicalDevices             = nullptr;
     PFN_vkEnumeratePhysicalDeviceGroups         EnumeratePhysicalDeviceGroups        = nullptr;
