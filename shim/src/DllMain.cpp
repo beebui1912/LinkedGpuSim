@@ -6,8 +6,13 @@
  */
 
 //  DllMain for D3D12Sim.dll.
-//  DLL_PROCESS_ATTACH   -> read config, open log, install D3D12 hook.
-//  DLL_PROCESS_DETACH   -> remove hook, restore vtable, close log.
+//  DLL_PROCESS_ATTACH   -> read config, open log, pin the DLL, install hooks.
+//  DLL_PROCESS_DETACH   -> log a summary and close the log.
+//
+//  The DLL is pinned (never unloaded): wrapped devices, queues and command
+//  lists dispatch through vtables and hooks that live in this module, and they
+//  may be alive until the process ends.  For the same reason nothing is
+//  restored at detach: during process exit the objects may already be freed.
 
 #ifndef WIN32_LEAN_AND_MEAN
 #    define WIN32_LEAN_AND_MEAN
@@ -17,10 +22,9 @@
 #endif
 #include <windows.h>
 
-#include "D3D12DeviceWrapper.hpp"
 #include "D3D12Hook.hpp"
-#include "DXGIFactoryWrapper.hpp"
 #include "DXGIHook.hpp"
+#include "NodeMasks.hpp"
 #include "ShimConfig.hpp"
 #include "ShimLog.hpp"
 
@@ -34,11 +38,16 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ReasonForCall, LPVOID /*lpReserved*
 
             // Reading the config first materialises the log-file setting so
             // that even a very early failure is captured on disk.
-            (void)D3D12Sim::GetConfig();
+            const auto& Cfg = D3D12Sim::GetConfig();
             D3D12Sim::LogInit();
 
-            D3D12Sim::LogInfo("D3D12Sim shim attached to process (PID=%lu, TID=%lu).",
-                              ::GetCurrentProcessId(), ::GetCurrentThreadId());
+            HMODULE hPinned = nullptr;
+            ::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                                 reinterpret_cast<LPCWSTR>(&DllMain), &hPinned);
+
+            D3D12Sim::LogInfo("D3D12Sim shim attached to process (PID=%lu): %u simulated nodes, validation %s, host adapter %s, virtual DXGI adapters %s.",
+                              ::GetCurrentProcessId(), Cfg.SimNodeCount, Cfg.Validate ? "on" : "off",
+                              Cfg.HasHostLuid ? "by LUID" : "any (no DILIGENT_SIM_HOST_ADAPTER_LUID)", Cfg.VirtualAdapters ? "on" : "off");
 
             if (!D3D12Sim::InstallD3D12Hooks())
             {
@@ -47,7 +56,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ReasonForCall, LPVOID /*lpReserved*
                 // Return TRUE anyway - failing DllMain would tear down the
                 // child process, which is worse than a passive shim.
             }
-            if (!D3D12Sim::InstallDXGIHooks())
+            if (Cfg.VirtualAdapters && !D3D12Sim::InstallDXGIHooks())
             {
                 D3D12Sim::LogError("D3D12Sim shim: DXGI hook installation failed; GpuInfoPanel "
                                    "will still show the real adapter list.");
@@ -57,11 +66,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ReasonForCall, LPVOID /*lpReserved*
 
         case DLL_PROCESS_DETACH:
         {
-            D3D12Sim::LogInfo("D3D12Sim shim detaching.");
-            D3D12Sim::RemoveDXGIHooks();
-            D3D12Sim::RemoveD3D12Hooks();
-            D3D12Sim::ReleaseFactoryWrappedState();
-            D3D12Sim::ReleaseWrappedState();
+            const unsigned Errors = D3D12Sim::GetValidationErrorCount();
+            D3D12Sim::LogInfo("D3D12Sim shim detaching: %u validation error(s).", Errors);
             D3D12Sim::LogShutdown();
             break;
         }

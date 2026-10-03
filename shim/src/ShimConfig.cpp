@@ -59,6 +59,23 @@ void InitConfig()
     g_Config.LogFilePath = GetEnvW(L"DILIGENT_SIM_LOG_FILE");
     g_Config.ParentPid   = ParseUInt(GetEnvW(L"DILIGENT_SIM_PARENT_PID"), 0);
     g_Config.Verbose     = ParseUInt(GetEnvW(L"DILIGENT_SIM_VERBOSE"), 0) != 0;
+    g_Config.Validate    = ParseUInt(GetEnvW(L"DILIGENT_SIM_VALIDATION"), 1) != 0;
+
+    g_Config.VirtualAdapters      = ParseUInt(GetEnvW(L"DILIGENT_SIM_VIRTUAL_ADAPTERS"), 0) != 0;
+    g_Config.CrossNodeSharingTier = ParseUInt(GetEnvW(L"DILIGENT_SIM_CROSS_NODE_TIER"), 1);
+
+    // "0xHIGH_0xLOW" as written by SimulationApp
+    const std::wstring Luid = GetEnvW(L"DILIGENT_SIM_HOST_ADAPTER_LUID");
+    const size_t       Sep  = Luid.find(L'_');
+    if (Sep != std::wstring::npos)
+    {
+        wchar_t*            End  = nullptr;
+        const unsigned long High = std::wcstoul(Luid.c_str(), &End, 16);
+        const unsigned long Low  = std::wcstoul(Luid.c_str() + Sep + 1, &End, 16);
+        g_Config.HostLuid.HighPart = static_cast<LONG>(High);
+        g_Config.HostLuid.LowPart  = static_cast<DWORD>(Low);
+        g_Config.HasHostLuid       = true;
+    }
 }
 
 } // namespace

@@ -14,6 +14,11 @@
 
 #pragma once
 
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
+
 #include <vulkan/vulkan.h>
 
 namespace VkSim
@@ -22,6 +27,13 @@ namespace VkSim
 struct InstanceData
 {
     VkInstance                                  Instance                             = VK_NULL_HANDLE;
+
+    // The physical device the simulated group is built on (chosen by LUID, else
+    // the first one), and the wrappers that stand for its other nodes. Created
+    // once per instance so that every enumeration returns the same handles.
+    bool                          HostResolved = false;
+    VkPhysicalDevice              Host         = VK_NULL_HANDLE;
+    std::vector<VkPhysicalDevice> NodeWrappers;
 
     // Base chain
     PFN_vkGetInstanceProcAddr                   GetInstanceProcAddr                  = nullptr;
@@ -72,11 +84,61 @@ struct InstanceData
 #endif
 };
 
+// A logical device. Found from any of its dispatchable handles (device, queue,
+// command buffer) by the loader dispatch key they share.
 struct DeviceData
 {
     PFN_vkGetDeviceProcAddr GetDeviceProcAddr = nullptr;
     PFN_vkDestroyDevice     DestroyDevice     = nullptr;
     VkDevice                Device            = VK_NULL_HANDLE;
+
+    // Devices of the simulated group the application created the device with;
+    // 1 for an ordinary device (all calls pass through unchanged)
+    uint32_t NodeCount = 1;
+
+    // Per memory type: whether its heap is device-local, i.e. has one instance
+    // per device of the group (VK_MEMORY_HEAP_MULTI_INSTANCE_BIT)
+    std::vector<bool> MultiInstanceType;
+
+    // Next-layer entry points of the intercepted device functions
+    PFN_vkQueueSubmit                      QueueSubmit                      = nullptr;
+    PFN_vkQueueSubmit2                     QueueSubmit2                     = nullptr;
+    PFN_vkQueueSubmit2                     QueueSubmit2KHR                  = nullptr;
+    PFN_vkQueueBindSparse                  QueueBindSparse                  = nullptr;
+    PFN_vkBeginCommandBuffer               BeginCommandBuffer               = nullptr;
+    PFN_vkFreeCommandBuffers               FreeCommandBuffers               = nullptr;
+    PFN_vkCmdSetDeviceMask                 CmdSetDeviceMask                 = nullptr;
+    PFN_vkCmdSetDeviceMask                 CmdSetDeviceMaskKHR              = nullptr;
+    PFN_vkCmdBeginRenderPass               CmdBeginRenderPass               = nullptr;
+    PFN_vkCmdBeginRenderPass2              CmdBeginRenderPass2              = nullptr;
+    PFN_vkCmdBeginRenderPass2              CmdBeginRenderPass2KHR           = nullptr;
+    PFN_vkCmdBeginRendering                CmdBeginRendering                = nullptr;
+    PFN_vkCmdBeginRendering                CmdBeginRenderingKHR             = nullptr;
+    PFN_vkAllocateMemory                   AllocateMemory                   = nullptr;
+    PFN_vkFreeMemory                       FreeMemory                       = nullptr;
+    PFN_vkMapMemory                        MapMemory                        = nullptr;
+    PFN_vkMapMemory2                       MapMemory2                       = nullptr;
+    PFN_vkMapMemory2                       MapMemory2KHR                    = nullptr;
+    PFN_vkBindBufferMemory2                BindBufferMemory2                = nullptr;
+    PFN_vkBindBufferMemory2                BindBufferMemory2KHR             = nullptr;
+    PFN_vkBindImageMemory2                 BindImageMemory2                 = nullptr;
+    PFN_vkBindImageMemory2                 BindImageMemory2KHR              = nullptr;
+    PFN_vkQueuePresentKHR                  QueuePresentKHR                  = nullptr;
+    PFN_vkAcquireNextImage2KHR             AcquireNextImage2KHR             = nullptr;
+
+    // State for validation
+    std::mutex                                   Mutex;
+    std::unordered_map<VkCommandBuffer, uint32_t> BeginMasks;     // device mask at vkBeginCommandBuffer
+    std::unordered_map<VkDeviceMemory, bool>      MultiInstance;  // allocations with several instances
 };
+
+// Loader dispatch key of a dispatchable handle
+inline void* GetDispatchKey(const void* Handle)
+{
+    return *static_cast<void* const*>(Handle);
+}
+
+// The device of a dispatchable handle; null if the device is not known
+DeviceData* FindDeviceByKey(const void* Handle);
 
 } // namespace VkSim

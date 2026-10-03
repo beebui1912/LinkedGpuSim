@@ -80,10 +80,19 @@ HRESULT WINAPI HookedD3D12CreateDevice(
         // (Microsoft's implementation returns the same instance pointer for
         // every ID3D12Device* interface via QueryInterface), so a cast to the
         // base is safe here regardless of the riid the caller requested.
-        auto* pDevice = static_cast<ID3D12Device*>(*ppDevice);
-        LogInfo("D3D12CreateDevice succeeded (FeatureLevel=0x%x) - wrapping device %p",
-                static_cast<unsigned>(MinimumFeatureLevel), pDevice);
-        WrapDevice(pDevice);
+        auto*       pDevice = static_cast<ID3D12Device*>(*ppDevice);
+        const auto& Cfg     = GetConfig();
+        const LUID  Luid    = pDevice->GetAdapterLuid();
+        if (Cfg.HasHostLuid && (Luid.HighPart != Cfg.HostLuid.HighPart || Luid.LowPart != Cfg.HostLuid.LowPart))
+        {
+            // Only the linked adapter has several nodes; other adapters keep their real behaviour
+            LogVerbose("D3D12CreateDevice: device %p is on adapter 0x%08X_0x%08X, not the host adapter - not wrapped",
+                       pDevice, static_cast<unsigned>(Luid.HighPart), static_cast<unsigned>(Luid.LowPart));
+        }
+        else
+        {
+            WrapDevice(pDevice);
+        }
     }
     else if (FAILED(hr))
     {

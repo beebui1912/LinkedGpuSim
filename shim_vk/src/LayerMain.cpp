@@ -45,6 +45,7 @@
 #include <vulkan/vk_layer.h>
 #include <vulkan/vulkan.h>
 
+#include "LayerConfig.hpp"
 #include "LayerDispatch.hpp"
 #include "LayerLog.hpp"
 #include "WrappedPhysicalDevice.hpp"
@@ -59,29 +60,19 @@ namespace VkSim
 // Config + globals
 // ---------------------------------------------------------------------------
 
-static uint32_t GetSimulatedNodeCountFromEnv()
-{
-    wchar_t Buf[16]{};
-    const DWORD Len = ::GetEnvironmentVariableW(L"DILIGENT_SIM_LINKED_NODE_COUNT",
-                                                Buf, static_cast<DWORD>(std::size(Buf)));
-    if (Len == 0 || Len >= std::size(Buf))
-        return 2;
-    unsigned long V = std::wcstoul(Buf, nullptr, 10);
-    if (V < 1) V = 1;
-    if (V > 8) V = 8;
-    return static_cast<uint32_t>(V);
-}
-
 static uint32_t GetSimulatedNodeCount()
 {
-    static const uint32_t N = GetSimulatedNodeCountFromEnv();
-    return N;
+    return GetConfig().NodeCount;
 }
 
+// LayerDevice.cpp
+void               LoadDeviceFunctions(DeviceData& D);
+PFN_vkVoidFunction GetDeviceGroupHook(const DeviceData& D, const char* pName);
 
-std::mutex                                          g_Mutex;
-std::unordered_map<VkInstance, InstanceData>        g_Instances;
-std::unordered_map<VkDevice,   DeviceData>          g_Devices;
+
+std::mutex                                                g_Mutex;
+std::unordered_map<VkInstance, InstanceData>              g_Instances;
+std::unordered_map<void*, std::unique_ptr<DeviceData>>    g_Devices; // by loader dispatch key
 
 // Cache of vkEnumeratePhysicalDevices results per instance (real handles) so
 // we can pick the primary when synthesizing groups.
@@ -94,11 +85,13 @@ InstanceData* FindInstance(VkInstance Inst)
     return It == g_Instances.end() ? nullptr : &It->second;
 }
 
-DeviceData* FindDevice(VkDevice Dev)
+DeviceData* FindDeviceByKey(const void* Handle)
 {
+    if (Handle == nullptr)
+        return nullptr;
     std::lock_guard<std::mutex> Lock(g_Mutex);
-    auto It = g_Devices.find(Dev);
-    return It == g_Devices.end() ? nullptr : &It->second;
+    auto It = g_Devices.find(GetDispatchKey(Handle));
+    return It == g_Devices.end() ? nullptr : It->second.get();
 }
 
 
@@ -305,13 +298,68 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkEnumeratePhysicalDevices(
 }
 
 
+// The physical device the simulated group is built on: the adapter whose LUID
+// SimulationApp passed (the one chosen as host), else the first one.
+VkPhysicalDevice GetHost(VkInstance Instance, InstanceData& Inst)
+{
+    {
+        std::lock_guard<std::mutex> Lock(g_Mutex);
+        if (Inst.HostResolved)
+            return Inst.Host;
+    }
+    uint32_t Count = 0;
+    Inst.EnumeratePhysicalDevices(Instance, &Count, nullptr);
+    std::vector<VkPhysicalDevice> Devices(Count);
+    if (Count > 0)
+        Inst.EnumeratePhysicalDevices(Instance, &Count, Devices.data());
+    Devices.resize(Count);
+
+    VkPhysicalDevice Host     = Devices.empty() ? VK_NULL_HANDLE : Devices.front();
+    const auto&      Cfg      = GetConfig();
+    auto             GetProps = Inst.GetPhysicalDeviceProperties2 ? Inst.GetPhysicalDeviceProperties2 : Inst.GetPhysicalDeviceProperties2KHR;
+    if (Cfg.HasHostLuid && GetProps != nullptr)
+    {
+        bool Found = false;
+        for (VkPhysicalDevice Pd : Devices)
+        {
+            VkPhysicalDeviceIDProperties Id{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+            VkPhysicalDeviceProperties2  Props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &Id};
+            GetProps(Pd, &Props);
+            if (Id.deviceLUIDValid && std::memcmp(Id.deviceLUID, Cfg.HostLuid, VK_LUID_SIZE) == 0)
+            {
+                Host  = Pd;
+                Found = true;
+                break;
+            }
+        }
+        if (!Found)
+            LogWarn("No Vulkan physical device has the host adapter LUID; the first one hosts the simulated group");
+    }
+
+    std::lock_guard<std::mutex> Lock(g_Mutex);
+    if (!Inst.HostResolved)
+    {
+        Inst.Host = Host;
+        // Wrappers for nodes 1..N-1, created once so that every enumeration returns the same handles
+        const uint32_t N = (std::min)(GetSimulatedNodeCount(), static_cast<uint32_t>(VK_MAX_DEVICE_GROUP_SIZE));
+        for (uint32_t k = 1; Host != VK_NULL_HANDLE && k < N; ++k)
+            Inst.NodeWrappers.push_back(WrapPhysicalDevice(Host, Instance, k, N));
+        Inst.HostResolved = true;
+        g_RealPhysicalDevices[Instance] = Devices;
+    }
+    return Inst.Host;
+}
+
+// Every physical device is in exactly one group. The host's group becomes the
+// simulated group [host, node 1, ...]; the groups of the other devices are
+// returned unchanged.
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkEnumeratePhysicalDeviceGroups(
     VkInstance                          Instance,
     uint32_t*                           pPhysicalDeviceGroupCount,
     VkPhysicalDeviceGroupProperties*    pPhysicalDeviceGroupProperties)
 {
     if (pPhysicalDeviceGroupCount == nullptr)
-        return VK_INCOMPLETE;
+        return VK_ERROR_INITIALIZATION_FAILED;
 
     InstanceData* pInst = FindInstance(Instance);
     if (pInst == nullptr) return VK_ERROR_INITIALIZATION_FAILED;
@@ -322,70 +370,50 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkEnumeratePhysicalDeviceGroups(
     if (pfnReal == nullptr)
         return VK_ERROR_EXTENSION_NOT_PRESENT;
 
-    const uint32_t N = GetSimulatedNodeCount();
+    const VkPhysicalDevice Host = GetHost(Instance, *pInst);
 
-    // Two-call idiom: probe first with pProperties==nullptr, then fill.
+    uint32_t RealCount = 0;
+    VkResult r         = pfnReal(Instance, &RealCount, nullptr);
+    if (r != VK_SUCCESS)
+        return r;
+    std::vector<VkPhysicalDeviceGroupProperties> Real(RealCount, VkPhysicalDeviceGroupProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GROUP_PROPERTIES});
+    r = pfnReal(Instance, &RealCount, Real.data());
+    if (r != VK_SUCCESS && r != VK_INCOMPLETE)
+        return r;
+    Real.resize(RealCount);
+
+    for (auto& G : Real)
+    {
+        if (G.physicalDeviceCount == 1 && G.physicalDevices[0] == Host && !pInst->NodeWrappers.empty())
+        {
+            // Index 0 stays the real handle, so pointer comparisons with the result of
+            // vkEnumeratePhysicalDevices (Diligent's adapter matching) still work
+            for (size_t k = 0; k < pInst->NodeWrappers.size(); ++k)
+                G.physicalDevices[k + 1] = pInst->NodeWrappers[k];
+            G.physicalDeviceCount = static_cast<uint32_t>(pInst->NodeWrappers.size() + 1);
+            G.subsetAllocation    = VK_FALSE;
+        }
+    }
+
     if (pPhysicalDeviceGroupProperties == nullptr)
     {
-        // Report exactly one group - the synthesized linked group.
-        *pPhysicalDeviceGroupCount = 1;
+        *pPhysicalDeviceGroupCount = static_cast<uint32_t>(Real.size());
         return VK_SUCCESS;
     }
-    if (*pPhysicalDeviceGroupCount < 1)
+    const uint32_t Written = (std::min)(*pPhysicalDeviceGroupCount, static_cast<uint32_t>(Real.size()));
+    for (uint32_t i = 0; i < Written; ++i)
     {
-        *pPhysicalDeviceGroupCount = 0;
-        return VK_INCOMPLETE;
+        // Keep the caller's sType/pNext
+        VkPhysicalDeviceGroupProperties& G = pPhysicalDeviceGroupProperties[i];
+        G.physicalDeviceCount              = Real[i].physicalDeviceCount;
+        std::memcpy(G.physicalDevices, Real[i].physicalDevices, sizeof(G.physicalDevices));
+        G.subsetAllocation = Real[i].subsetAllocation;
     }
-
-    // Find the primary real physical device.  Prefer the cached list; if
-    // empty, do a live enumeration via the next-layer function.
-    VkPhysicalDevice Primary = VK_NULL_HANDLE;
-    {
-        std::lock_guard<std::mutex> Lock(g_Mutex);
-        auto It = g_RealPhysicalDevices.find(Instance);
-        if (It != g_RealPhysicalDevices.end() && !It->second.empty())
-            Primary = It->second.front();
-    }
-    if (Primary == VK_NULL_HANDLE)
-    {
-        uint32_t                       Count = 0;
-        pInst->EnumeratePhysicalDevices(Instance, &Count, nullptr);
-        if (Count == 0) return VK_ERROR_INITIALIZATION_FAILED;
-        std::vector<VkPhysicalDevice> Pds(Count);
-        pInst->EnumeratePhysicalDevices(Instance, &Count, Pds.data());
-        Primary = Pds.front();
-
-        std::lock_guard<std::mutex> Lock(g_Mutex);
-        g_RealPhysicalDevices[Instance] = std::move(Pds);
-    }
-
-    // Fill the (single) synthesized group.
-    VkPhysicalDeviceGroupProperties& G = pPhysicalDeviceGroupProperties[0];
-    std::memset(&G, 0, sizeof(G));
-    G.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GROUP_PROPERTIES;
-
-    const uint32_t Capacity = static_cast<uint32_t>(VK_MAX_DEVICE_GROUP_SIZE);
-    const uint32_t NClamped = (N > Capacity) ? Capacity : N;
-    G.physicalDeviceCount = NClamped;
-    // Index 0 is the REAL primary so callers doing pointer equality against
-    // whatever they got out of vkEnumeratePhysicalDevices (e.g. Diligent's
-    // linked-group membership check inside EnumerateAdapters) still match.
-    // Indices 1..N-1 are dispatchable wrappers so the Vulkan spec's
-    // "distinct handles" requirement inside a group is honoured.  Every
-    // wrapped handle is unwrapped back to the real primary by our
-    // Layer_vkCreateDevice intercept before the ICD sees it.
-    G.physicalDevices[0] = Primary;
-    for (uint32_t k = 1; k < NClamped; ++k)
-        G.physicalDevices[k] = WrapPhysicalDevice(Primary, Instance, k, NClamped);
-    // Subset allocations aren't supported by our fake group.
-    G.subsetAllocation = VK_FALSE;
-
-    *pPhysicalDeviceGroupCount = 1;
-    LogInfo("vkEnumeratePhysicalDeviceGroups: synthesized 1 group with %u physical devices "
-            "(primary=%p, %u wrapped nodes).", NClamped, static_cast<void*>(Primary), NClamped - 1u);
-    return VK_SUCCESS;
+    *pPhysicalDeviceGroupCount = Written;
+    LogVerbose("vkEnumeratePhysicalDeviceGroups: %u group(s); host %p in a simulated group of %u devices",
+               Written, static_cast<void*>(Host), static_cast<unsigned>(pInst->NodeWrappers.size() + 1));
+    return Written < Real.size() ? VK_INCOMPLETE : VK_SUCCESS;
 }
-
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkEnumeratePhysicalDeviceGroupsKHR(
     VkInstance                          Instance,
     uint32_t*                           pPhysicalDeviceGroupCount,
@@ -422,110 +450,101 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreateDevice(
     if (pfnNextCreateDevice == nullptr)
         return VK_ERROR_INITIALIZATION_FAILED;
 
-    // Unwrap the main physicalDevice argument.
     VkPhysicalDevice RealPhys = UnwrapOr(PhysicalDevice);
 
-    // We want to rewrite VkDeviceGroupDeviceCreateInfo::pPhysicalDevices to
-    // hold unwrapped handles.  Since we can't modify the caller's linked
-    // list nodes in place (they're const), we take a shallow copy of the
-    // outer VkDeviceCreateInfo and, if the group info is found, splice a
-    // local copy of it in at the head of the pNext chain - our local group
-    // info's pNext points to whatever came AFTER the original group info in
-    // the caller's chain, and any nodes BEFORE the original group info stay
-    // reachable through their positions in the caller's chain via a small
-    // shim: we detect that case and issue a warning, since Diligent
-    // typically places the group info at the head.
-    VkDeviceCreateInfo             LocalCreateInfo   = *pCreateInfo;
-    VkDeviceGroupDeviceCreateInfo  LocalGroupInfo{};
-    std::vector<VkPhysicalDevice>  LocalGroupDevices;
-
-    const VkBaseInStructure* pHead        = static_cast<const VkBaseInStructure*>(pCreateInfo->pNext);
-    const VkBaseInStructure* pGroupPrev   = nullptr; // node whose pNext is the group info, or null if head.
-    const VkBaseInStructure* pGroupSrc    = nullptr;
-    for (auto* p = pHead; p != nullptr; p = p->pNext)
-    {
+    // A device of the simulated group: VkDeviceGroupDeviceCreateInfo lists the
+    // host and wrappers of its other nodes. The driver gets an ordinary device
+    // (physicalDeviceCount 1); LayerDevice.cpp maps the group's device masks and
+    // indices onto it. The structure is const caller memory that other
+    // structures may point to, so it is patched in place and restored.
+    const VkDeviceGroupDeviceCreateInfo* pGroup = nullptr;
+    for (auto* p = static_cast<const VkBaseInStructure*>(pCreateInfo->pNext); p != nullptr; p = p->pNext)
         if (p->sType == VK_STRUCTURE_TYPE_DEVICE_GROUP_DEVICE_CREATE_INFO)
-        {
-            pGroupSrc = p;
-            break;
-        }
-        pGroupPrev = p;
-    }
+            pGroup = reinterpret_cast<const VkDeviceGroupDeviceCreateInfo*>(p);
 
-    if (pGroupSrc != nullptr)
+    uint32_t SimNodeCount = 1;
+    if (pGroup != nullptr && pGroup->physicalDeviceCount > 1 && pGroup->pPhysicalDevices != nullptr)
     {
-        auto* SrcG = reinterpret_cast<const VkDeviceGroupDeviceCreateInfo*>(pGroupSrc);
-        LocalGroupInfo = *SrcG;
-        LocalGroupDevices.resize(SrcG->physicalDeviceCount);
-        uint32_t Wrapped = 0;
-        for (uint32_t i = 0; i < SrcG->physicalDeviceCount; ++i)
+        bool AllSimulated = true;
+        for (uint32_t i = 0; i < pGroup->physicalDeviceCount; ++i)
+            AllSimulated = AllSimulated && UnwrapOr(pGroup->pPhysicalDevices[i]) == RealPhys;
+        if (AllSimulated)
         {
-            LocalGroupDevices[i] = UnwrapOr(SrcG->pPhysicalDevices[i]);
-            if (LocalGroupDevices[i] != SrcG->pPhysicalDevices[i]) ++Wrapped;
-        }
-        LocalGroupInfo.pPhysicalDevices = LocalGroupDevices.data();
-        // Skip past the original group info in the caller's chain.
-        LocalGroupInfo.pNext = pGroupSrc->pNext;
-        LogInfo("vkCreateDevice: rewrote VkDeviceGroupDeviceCreateInfo "
-                "(physicalDeviceCount=%u, wrappedEntries=%u).",
-                SrcG->physicalDeviceCount, Wrapped);
-
-        if (pGroupPrev == nullptr)
-        {
-            // Common case: group info was at pNext head.  Point our outer
-            // create info's pNext at our local copy.
-            LocalCreateInfo.pNext = &LocalGroupInfo;
-        }
-        else
-        {
-            // Rare case: group info was deeper in the chain.  We can't
-            // modify pGroupPrev->pNext (const caller memory), so fall back
-            // to prepending our copy at the head and hoping the driver
-            // tolerates a duplicate-looking chain.  Also warn.
-            LogWarn("vkCreateDevice: VkDeviceGroupDeviceCreateInfo was not at pNext "
-                    "head; prepending unwrapped copy at head (chain may have a "
-                    "shadow entry).  If you see this in a real app, add a proper "
-                    "deep-copy path.");
-            LocalGroupInfo.pNext  = pCreateInfo->pNext; // preserve full incoming chain
-            LocalCreateInfo.pNext = &LocalGroupInfo;
+            if (GetConfig().Validate)
+            {
+                for (uint32_t i = 0; i < pGroup->physicalDeviceCount; ++i)
+                    for (uint32_t j = i + 1; j < pGroup->physicalDeviceCount; ++j)
+                        if (pGroup->pPhysicalDevices[i] == pGroup->pPhysicalDevices[j])
+                            ReportValidationError("vkCreateDevice: VkDeviceGroupDeviceCreateInfo lists physical device %u twice (VUID-VkDeviceGroupDeviceCreateInfo-pPhysicalDevices-00375)", i);
+            }
+            SimNodeCount = pGroup->physicalDeviceCount;
         }
     }
 
-    const VkResult r = pfnNextCreateDevice(RealPhys, &LocalCreateInfo, pAllocator, pDevice);
+    auto* pGroupMutable = const_cast<VkDeviceGroupDeviceCreateInfo*>(pGroup);
+    const uint32_t                SavedCount   = pGroup != nullptr ? pGroup->physicalDeviceCount : 0;
+    const VkPhysicalDevice* const SavedDevices = pGroup != nullptr ? pGroup->pPhysicalDevices : nullptr;
+    if (SimNodeCount > 1)
+    {
+        pGroupMutable->physicalDeviceCount = 1;
+        pGroupMutable->pPhysicalDevices    = &RealPhys;
+    }
+    const VkResult r = pfnNextCreateDevice(RealPhys, pCreateInfo, pAllocator, pDevice);
+    if (SimNodeCount > 1)
+    {
+        pGroupMutable->physicalDeviceCount = SavedCount;
+        pGroupMutable->pPhysicalDevices    = SavedDevices;
+    }
     if (r != VK_SUCCESS)
     {
         LogError("vkCreateDevice failed: %d", static_cast<int>(r));
         return r;
     }
 
-    DeviceData dd{};
-    dd.Device            = *pDevice;
-    dd.GetDeviceProcAddr = pfnNextGdpa;
-    dd.DestroyDevice     = reinterpret_cast<PFN_vkDestroyDevice>(pfnNextGdpa(*pDevice, "vkDestroyDevice"));
+    auto dd               = std::make_unique<DeviceData>();
+    dd->Device            = *pDevice;
+    dd->GetDeviceProcAddr = pfnNextGdpa;
+    dd->DestroyDevice     = reinterpret_cast<PFN_vkDestroyDevice>(pfnNextGdpa(*pDevice, "vkDestroyDevice"));
+    dd->NodeCount         = SimNodeCount;
+    if (SimNodeCount > 1)
+    {
+        LoadDeviceFunctions(*dd);
+        // Device-local heaps have one instance per device of a real group
+        if (InstanceData* pInst = GetInstanceForPD(PhysicalDevice); pInst != nullptr && pInst->GetPhysicalDeviceMemoryProperties != nullptr)
+        {
+            VkPhysicalDeviceMemoryProperties Mem{};
+            pInst->GetPhysicalDeviceMemoryProperties(RealPhys, &Mem);
+            for (uint32_t i = 0; i < Mem.memoryTypeCount; ++i)
+                dd->MultiInstanceType.push_back((Mem.memoryHeaps[Mem.memoryTypes[i].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0);
+        }
+    }
     {
         std::lock_guard<std::mutex> Lock(g_Mutex);
-        g_Devices[*pDevice] = dd;
+        g_Devices[GetDispatchKey(*pDevice)] = std::move(dd);
     }
-    LogInfo("vkCreateDevice: device %p bound (real physical %p).", *pDevice, RealPhys);
+    if (SimNodeCount > 1)
+        LogInfo("vkCreateDevice: device %p is a simulated group of %u devices on physical device %p.", *pDevice, SimNodeCount, RealPhys);
+    else
+        LogVerbose("vkCreateDevice: device %p (physical %p), not simulated.", *pDevice, RealPhys);
     return VK_SUCCESS;
 }
 
 VKAPI_ATTR void VKAPI_CALL Layer_vkDestroyDevice(VkDevice Device, const VkAllocationCallbacks* pAllocator)
 {
-    PFN_vkDestroyDevice pfn = nullptr;
+    std::unique_ptr<DeviceData> dd;
     {
         std::lock_guard<std::mutex> Lock(g_Mutex);
-        auto It = g_Devices.find(Device);
+        auto It = g_Devices.find(GetDispatchKey(Device));
         if (It != g_Devices.end())
         {
-            pfn = It->second.DestroyDevice;
+            dd = std::move(It->second);
             g_Devices.erase(It);
         }
     }
     LogVerbose("vkDestroyDevice: %p", Device);
-    if (pfn) pfn(Device, pAllocator);
+    if (dd && dd->DestroyDevice)
+        dd->DestroyDevice(Device, pAllocator);
 }
-
 
 // ---------------------------------------------------------------------------
 // vkGetPhysicalDeviceProperties[2] - unwrap + append "[Simulated Node k]"
@@ -603,6 +622,24 @@ static void SplitMemoryHeapSizes(VkPhysicalDeviceMemoryProperties* pMem, uint32_
     }
 }
 
+// In a logical device made of several physical devices, device-local heaps have
+// one instance per device; real group-capable drivers report that on every
+// member, and allocations from such heaps cannot be mapped with several instances
+static void MarkMultiInstanceHeaps(VkPhysicalDeviceMemoryProperties* pMem)
+{
+    for (uint32_t i = 0; pMem != nullptr && i < pMem->memoryHeapCount; ++i)
+        if (pMem->memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+            pMem->memoryHeaps[i].flags |= VK_MEMORY_HEAP_MULTI_INSTANCE_BIT;
+}
+
+static bool IsSimulatedGroupMember(VkPhysicalDevice Pd, const InstanceData& Inst)
+{
+    if (TryUnwrap(Pd) != nullptr)
+        return true;
+    std::lock_guard<std::mutex> Lock(g_Mutex);
+    return Inst.HostResolved && Pd == Inst.Host && !Inst.NodeWrappers.empty();
+}
+
 VKAPI_ATTR void VKAPI_CALL Layer_GetPhysicalDeviceMemoryProperties(
     VkPhysicalDevice PhysicalDevice, VkPhysicalDeviceMemoryProperties* pMem)
 {
@@ -613,6 +650,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_GetPhysicalDeviceMemoryProperties(
 
     Inst->GetPhysicalDeviceMemoryProperties(Real, pMem);
     if (w != nullptr) SplitMemoryHeapSizes(pMem, w->NodeCount);
+    if (IsSimulatedGroupMember(PhysicalDevice, *Inst)) MarkMultiInstanceHeaps(pMem);
 }
 
 VKAPI_ATTR void VKAPI_CALL Layer_GetPhysicalDeviceMemoryProperties2(
@@ -631,6 +669,8 @@ VKAPI_ATTR void VKAPI_CALL Layer_GetPhysicalDeviceMemoryProperties2(
 
     if (w != nullptr && pMem != nullptr)
         SplitMemoryHeapSizes(&pMem->memoryProperties, w->NodeCount);
+    if (pMem != nullptr && IsSimulatedGroupMember(PhysicalDevice, *Inst))
+        MarkMultiInstanceHeaps(&pMem->memoryProperties);
 }
 
 VKAPI_ATTR void VKAPI_CALL Layer_GetPhysicalDeviceMemoryProperties2KHR(
@@ -868,8 +908,12 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL Layer_vkGetDeviceProcAddr(VkDevice Devi
     ROUTE(DestroyDevice);
 
     if (Device == VK_NULL_HANDLE) return nullptr;
-    DeviceData* pDev = FindDevice(Device);
+    DeviceData* pDev = FindDeviceByKey(Device);
     if (pDev == nullptr || pDev->GetDeviceProcAddr == nullptr) return nullptr;
+    // Devices of the simulated group: device masks and indices are mapped (LayerDevice.cpp)
+    if (pDev->NodeCount > 1)
+        if (PFN_vkVoidFunction pfn = GetDeviceGroupHook(*pDev, pName))
+            return pfn;
     return pDev->GetDeviceProcAddr(Device, pName);
 }
 

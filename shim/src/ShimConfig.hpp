@@ -46,6 +46,27 @@ struct ShimConfig
     // If true, the shim reports every hooked call via ShimLog::LogInfo.
     // Set with DILIGENT_SIM_VERBOSE=1 (default off).
     bool Verbose = false;
+
+    // Check node masks and cross-node use against the simulated topology and
+    // reject or report what real linked hardware would reject (see NodeMasks.hpp).
+    // DILIGENT_SIM_VALIDATION=0 turns this off (masks are only remapped).
+    bool Validate = true;
+
+    // Only devices on this adapter get simulated nodes, like real hardware where
+    // only the linked adapter has several. DILIGENT_SIM_HOST_ADAPTER_LUID
+    // ("0xHIGH_0xLOW", set by SimulationApp); without it every device is wrapped.
+    bool  HasHostLuid = false;
+    LUID  HostLuid    = {};
+
+    // Add one virtual DXGI adapter per simulated node in front of the real
+    // adapter list (DILIGENT_SIM_VIRTUAL_ADAPTERS=1). A real linked adapter is ONE
+    // DXGI adapter with several nodes, so this is off by default; it exists for
+    // tools that show one entry per GPU (Diligent's GpuInfoPanel).
+    bool VirtualAdapters = false;
+
+    // D3D12_CROSS_NODE_SHARING_TIER reported by CheckFeatureSupport
+    // (DILIGENT_SIM_CROSS_NODE_TIER, default 1: cross-node copies only).
+    unsigned CrossNodeSharingTier = 1;
 };
 
 // Reads the configuration from environment variables.  Idempotent; safe to

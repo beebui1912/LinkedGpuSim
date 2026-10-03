@@ -21,6 +21,13 @@ set(D3D12SIM_SOURCES
     src/D3D12Vtable.hpp
     src/D3D12DeviceWrapper.cpp
     src/D3D12DeviceWrapper.hpp
+    src/D3D12CommandWrappers.cpp
+    src/D3D12CommandWrappers.hpp
+    src/D3D12VtableCheck.cpp
+    src/NodeMasks.cpp
+    src/NodeMasks.hpp
+    src/VtableShadow.cpp
+    src/VtableShadow.hpp
     src/DXGIHook.cpp
     src/DXGIHook.hpp
     src/DXGIFactoryWrapper.cpp

@@ -7,68 +7,60 @@
 
 //  D3D12Vtable
 //  -----------
-//  Constant slot indices in the ID3D12Device vtable, in declaration order in
-//  d3d12.h.  Kept stable across Windows SDK versions per the ABI-stability
-//  guarantee (Microsoft only appends to derived interfaces, never reorders).
+//  Slot indices in the vtables the shim patches, in declaration order in
+//  d3d12.h.  Microsoft only appends to derived interfaces, so the indices are
+//  stable; D3D12VtableCheck.cpp verifies every index used here against the
+//  SDK headers at compile time.
 
 #pragma once
 
 namespace D3D12Sim
 {
 
-// Base IUnknown (3 slots).
-constexpr int kSlot_QueryInterface           = 0;
-constexpr int kSlot_AddRef                   = 1;
-constexpr int kSlot_Release                  = 2;
+// ---- ID3D12Device (IUnknown 0-2, ID3D12Object 3-6) -------------------------
+constexpr int kSlot_GetNodeCount                = 7;
+constexpr int kSlot_CreateCommandQueue          = 8;
+constexpr int kSlot_CreateGraphicsPipelineState = 10;
+constexpr int kSlot_CreateComputePipelineState  = 11;
+constexpr int kSlot_CreateCommandList           = 12;
+constexpr int kSlot_CheckFeatureSupport         = 13;
+constexpr int kSlot_CreateDescriptorHeap        = 14;
+constexpr int kSlot_CreateRootSignature         = 16;
+constexpr int kSlot_GetResourceAllocationInfo   = 25; // returns a struct (hidden pointer)
+constexpr int kSlot_GetCustomHeapProperties     = 26; // returns a struct (hidden pointer)
+constexpr int kSlot_CreateCommittedResource     = 27;
+constexpr int kSlot_CreateHeap                  = 28;
+constexpr int kSlot_CreatePlacedResource        = 29;
+constexpr int kSlot_CreateQueryHeap             = 39;
+constexpr int kSlot_CreateCommandSignature      = 41;
+constexpr int kSlot_GetAdapterLuid              = 43; // returns a struct (hidden pointer)
 
-// ID3D12Object (adds 4).
-constexpr int kSlot_GetPrivateData           = 3;
-constexpr int kSlot_SetPrivateData           = 4;
-constexpr int kSlot_SetPrivateDataInterface  = 5;
-constexpr int kSlot_SetName                  = 6;
+// ---- ID3D12Device1 .. ID3D12Device10 ---------------------------------------
+constexpr int kSlot_CreatePipelineState         = 47; // ID3D12Device2
+constexpr int kSlot_CreateCommandList1          = 51; // ID3D12Device4
+constexpr int kSlot_CreateCommittedResource1    = 53; // ID3D12Device4
+constexpr int kSlot_CreateHeap1                 = 54; // ID3D12Device4
+constexpr int kSlot_GetResourceAllocationInfo1  = 56; // ID3D12Device4, returns a struct
+constexpr int kSlot_CreateStateObject           = 62; // ID3D12Device5
+constexpr int kSlot_GetResourceAllocationInfo2  = 68; // ID3D12Device8, returns a struct
+constexpr int kSlot_CreateCommittedResource2    = 69; // ID3D12Device8
+constexpr int kSlot_CreatePlacedResource1       = 70; // ID3D12Device8
+constexpr int kSlot_CreateCommandQueue1         = 75; // ID3D12Device9
+constexpr int kSlot_CreateCommittedResource3    = 76; // ID3D12Device10
+constexpr int kSlot_CreatePlacedResource2       = 77; // ID3D12Device10
 
-// ID3D12Device (adds the rest, 44 total for the base interface).
-constexpr int kSlot_GetNodeCount                     = 7;   // patched
-constexpr int kSlot_CreateCommandQueue               = 8;   // patched
-constexpr int kSlot_CreateCommandAllocator           = 9;
-constexpr int kSlot_CreateGraphicsPipelineState      = 10;
-constexpr int kSlot_CreateComputePipelineState       = 11;
-constexpr int kSlot_CreateCommandList                = 12;  // patched
-constexpr int kSlot_CheckFeatureSupport              = 13;
-constexpr int kSlot_CreateDescriptorHeap             = 14;  // patched
-constexpr int kSlot_GetDescriptorHandleIncrementSize = 15;
-constexpr int kSlot_CreateRootSignature              = 16;
-constexpr int kSlot_CreateConstantBufferView         = 17;
-constexpr int kSlot_CreateShaderResourceView         = 18;
-constexpr int kSlot_CreateUnorderedAccessView        = 19;
-constexpr int kSlot_CreateRenderTargetView           = 20;
-constexpr int kSlot_CreateDepthStencilView           = 21;
-constexpr int kSlot_CreateSampler                    = 22;
-constexpr int kSlot_CopyDescriptors                  = 23;
-constexpr int kSlot_CopyDescriptorsSimple            = 24;
-constexpr int kSlot_GetResourceAllocationInfo        = 25;  // patched (sret)
-constexpr int kSlot_GetCustomHeapProperties          = 26;  // patched (sret)
-constexpr int kSlot_CreateCommittedResource          = 27;  // patched
-constexpr int kSlot_CreateHeap                       = 28;  // patched
-constexpr int kSlot_CreatePlacedResource             = 29;
-constexpr int kSlot_CreateReservedResource           = 30;
-constexpr int kSlot_CreateSharedHandle               = 31;
-constexpr int kSlot_OpenSharedHandle                 = 32;
-constexpr int kSlot_OpenSharedHandleByName           = 33;
-constexpr int kSlot_MakeResident                     = 34;
-constexpr int kSlot_Evict                            = 35;
-constexpr int kSlot_CreateFence                      = 36;
-constexpr int kSlot_GetDeviceRemovedReason           = 37;
-constexpr int kSlot_GetCopyableFootprints            = 38;
-constexpr int kSlot_CreateQueryHeap                  = 39;  // patched
-constexpr int kSlot_SetStablePowerState              = 40;
-constexpr int kSlot_CreateCommandSignature           = 41;  // patched
-constexpr int kSlot_GetResourceTiling                = 42;
-constexpr int kSlot_GetAdapterLuid                   = 43;
+// ---- ID3D12CommandQueue (ID3D12DeviceChild::GetDevice is 7) ---------------
+constexpr int kQueueSlot_ExecuteCommandLists = 10;
+constexpr int kQueueSlot_GetDesc             = 18; // returns a struct (hidden pointer)
 
-// Extended interfaces (ID3D12Device1..14) append at higher slots.  We copy
-// this many entries from the original vtable so QueryInterface'd extended
-// interfaces still see the real driver code for methods we do not touch.
+// ---- ID3D12GraphicsCommandList (ID3D12CommandList::GetType is 8) ----------
+constexpr int kListSlot_CopyBufferRegion  = 15;
+constexpr int kListSlot_CopyTextureRegion = 16;
+constexpr int kListSlot_CopyResource      = 17;
+
+// Entries copied from an original vtable into its shadow, so that methods of
+// derived interfaces (ID3D12Device14, ID3D12GraphicsCommandList10, ...) that
+// the shim does not patch still reach the real implementation.
 constexpr int kVtblCopySlots = 256;
 
 } // namespace D3D12Sim

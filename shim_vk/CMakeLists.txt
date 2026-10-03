@@ -26,6 +26,9 @@ endif()
 
 set(VKLAYER_SOURCES
     src/LayerMain.cpp
+    src/LayerDevice.cpp
+    src/LayerConfig.cpp
+    src/LayerConfig.hpp
     src/LayerDispatch.hpp
     src/LayerLog.cpp
     src/LayerLog.hpp

@@ -164,3 +164,12 @@ option(DILIGENT_GPUSIM_BUILD_LAUNCHER "Build the GUI launcher (SimulationLaunche
 if(DILIGENT_GPUSIM_BUILD_LAUNCHER)
     add_subdirectory(launcher)
 endif()
+
+# ---------------------------------------------------------------------------
+# Self-tests of the shims on the real driver (tests/). Run with ctest.
+# ---------------------------------------------------------------------------
+option(DILIGENT_GPUSIM_BUILD_TESTS "Build the shim self-tests" ON)
+if(DILIGENT_GPUSIM_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()

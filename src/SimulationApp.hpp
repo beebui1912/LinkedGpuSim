@@ -57,7 +57,23 @@ struct SimulationOptions
     // How often the GPU stats snapshot is written to the log while the child
     // is alive (in seconds).  Set to 0 or a huge value to disable.
     double RefreshSeconds = 2.0;
+
+    // The shims check the child's use of the simulated nodes like linked
+    // hardware would (DILIGENT_SIM_VALIDATION). A run with validation errors
+    // ends with exit code 3 when the child itself succeeded.
+    bool Validate = true;
+
+    // One virtual DXGI adapter per node in front of the real list
+    // (DILIGENT_SIM_VIRTUAL_ADAPTERS). Real linked hardware is one adapter, so off.
+    bool VirtualAdapters = false;
+
+    // D3D12 cross-node sharing tier reported to the child (0..3)
+    unsigned CrossNodeTier = 1;
 };
+
+// Exit code of a run whose child succeeded but used the simulated nodes in a
+// way linked hardware would reject
+constexpr int kExitValidationErrors = 3;
 
 // Parses argv into OutOpts. On error, returns false and populates OutErr.
 // If the user passed -h/--help, OutShowHelp is set to true and the caller

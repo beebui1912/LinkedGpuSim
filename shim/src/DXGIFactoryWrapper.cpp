@@ -77,7 +77,9 @@ Microsoft::WRL::ComPtr<IDXGIAdapter1> FindPrimaryRealAdapter_Unlocked(
     using pfnEnumAdapters1 = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory1*, UINT, IDXGIAdapter1**);
     auto pfnReal = reinterpret_cast<pfnEnumAdapters1>(OrigVtbl[kSlot_EnumAdapters1]);
 
+    const auto&                           Cfg = GetConfig();
     Microsoft::WRL::ComPtr<IDXGIAdapter1> FirstAny;
+    Microsoft::WRL::ComPtr<IDXGIAdapter1> FirstHardware;
     for (UINT i = 0;; ++i)
     {
         Microsoft::WRL::ComPtr<IDXGIAdapter1> A;
@@ -85,11 +87,14 @@ Microsoft::WRL::ComPtr<IDXGIAdapter1> FindPrimaryRealAdapter_Unlocked(
             break;
         DXGI_ADAPTER_DESC1 Desc{};
         A->GetDesc1(&Desc);
-        if (!FirstAny) FirstAny = A;
-        if ((Desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0)
+        // The host adapter chosen by SimulationApp, when known
+        if (Cfg.HasHostLuid && Desc.AdapterLuid.HighPart == Cfg.HostLuid.HighPart && Desc.AdapterLuid.LowPart == Cfg.HostLuid.LowPart)
             return A;
+        if (!FirstAny) FirstAny = A;
+        if (!FirstHardware && (Desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0)
+            FirstHardware = A;
     }
-    return FirstAny;
+    return FirstHardware ? FirstHardware : FirstAny;
 }
 
 // ---------------------------------------------------------------------------

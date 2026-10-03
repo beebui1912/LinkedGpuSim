@@ -74,6 +74,9 @@ public:
 
     const std::filesystem::path& GetLogPath() const { return m_LogPath; }
 
+    // Lines the shims wrote to the child's stderr as "VALIDATION ERROR"
+    unsigned GetValidationErrorCount() const { return m_ValidationErrors.load(); }
+
 private:
     void WriteToOutputs(const std::string& Text, bool ToStdout, bool ToStderr, bool ToFile);
 
@@ -81,6 +84,7 @@ private:
     std::FILE*            m_File          = nullptr;
     bool                  m_EchoToConsole = true;
     std::filesystem::path m_LogPath;
+    std::atomic<unsigned> m_ValidationErrors{0};
 };
 
 class PipeReader

@@ -145,6 +145,9 @@ void LogSink::WriteLine(const std::string& Prefix, const std::string& Line)
 {
     std::string Formatted = BuildLogLine(Prefix, Line);
     const bool  IsErr     = Prefix.find("err") != std::string::npos;
+    // Counted on the stderr channel only: the shims also log through OutputDebugString
+    if (IsErr && Line.find("VALIDATION ERROR") != std::string::npos)
+        ++m_ValidationErrors;
     std::lock_guard<std::mutex> Lock(m_Mutex);
     WriteToOutputs(Formatted, /*ToStdout*/ !IsErr, /*ToStderr*/ IsErr, /*ToFile*/ true);
 }

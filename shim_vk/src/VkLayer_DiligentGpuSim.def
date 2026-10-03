@@ -3,3 +3,4 @@ EXPORTS
     vkNegotiateLoaderLayerInterfaceVersion
     vk_layerGetInstanceProcAddr
     vk_layerGetDeviceProcAddr
+    VkSim_GetValidationErrorCount

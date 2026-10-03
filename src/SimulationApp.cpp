@@ -157,6 +157,13 @@ void PrintHelp()
         "      --no-driver-shim   Disable the driver-level shim (default).\n"
         "      --shim-dll PATH    Explicit path to D3D12Sim.dll; implies\n"
         "                         --driver-shim. Default: next to SimulationApp.exe.\n"
+        "      --no-validation    Do not check the child's node masks and device masks\n"
+        "                         (by default a run whose child succeeds but uses the\n"
+        "                         simulated nodes invalidly exits with code 3).\n"
+        "      --virtual-adapters Also list one virtual DXGI adapter per node (for UIs\n"
+        "                         that show one entry per GPU). Real linked hardware is\n"
+        "                         one adapter with several nodes, so this is off.\n"
+        "      --cross-node-tier N  D3D12 cross-node sharing tier reported (0..3, default 1).\n"
         "      --refresh SEC      GPU stats refresh interval in seconds\n"
         "                         (0 to disable periodic snapshots). Default: 2.0.\n"
         "  -h, --help             Show this help.\n"
@@ -173,6 +180,10 @@ void PrintHelp()
         "  DILIGENT_SIM_HOST_ADAPTER_LUID   Host adapter LUID (HIGH_LOW hex).\n"
         "  DILIGENT_SIM_LOG_FILE            Path to the shared log file.\n"
         "  DILIGENT_SIM_PARENT_PID          Parent (SimulationApp) PID.\n"
+        "  DILIGENT_SIM_VALIDATION          0 with --no-validation.\n"
+        "  DILIGENT_SIM_VIRTUAL_ADAPTERS    1 with --virtual-adapters.\n"
+        "  DILIGENT_SIM_CROSS_NODE_TIER     --cross-node-tier.\n"
+        "  VK_ADD_LAYER_PATH, VK_INSTANCE_LAYERS   with --driver-shim: the Vulkan layer.\n"
         "\n";
     std::fputs(kHelp, stdout);
 }
@@ -254,6 +265,24 @@ bool ParseCommandLine(int argc, wchar_t** argv,
                 if (i + 1 >= argc) { OutErr = "--shim-dll requires a path."; return false; }
                 OutOpts.ShimDllPath   = std::filesystem::path{argv[++i]};
                 OutOpts.UseDriverShim = true;
+                continue;
+            }
+            if (EqualsAny(Arg, {L"--no-validation"}))
+            {
+                OutOpts.Validate = false;
+                continue;
+            }
+            if (EqualsAny(Arg, {L"--virtual-adapters"}))
+            {
+                OutOpts.VirtualAdapters = true;
+                continue;
+            }
+            if (EqualsAny(Arg, {L"--cross-node-tier"}))
+            {
+                if (i + 1 >= argc) { OutErr = "--cross-node-tier requires 0..3."; return false; }
+                unsigned N = 0;
+                if (!ParseUInt(argv[++i], N) || N > 3) { OutErr = "--cross-node-tier must be between 0 and 3."; return false; }
+                OutOpts.CrossNodeTier = N;
                 continue;
             }
             if (EqualsAny(Arg, {L"--info-only"}))
@@ -472,6 +501,9 @@ int SimulationApp::Run(const SimulationOptions& InOpts)
     if (!LogPath.empty())
         AddEnv(L"DILIGENT_SIM_LOG_FILE", LogPath.wstring());
     AddEnv(L"DILIGENT_SIM_PARENT_PID", std::to_wstring(::GetCurrentProcessId()));
+    AddEnv(L"DILIGENT_SIM_VALIDATION", Opts.Validate ? L"1" : L"0");
+    AddEnv(L"DILIGENT_SIM_VIRTUAL_ADAPTERS", Opts.VirtualAdapters ? L"1" : L"0");
+    AddEnv(L"DILIGENT_SIM_CROSS_NODE_TIER", std::to_wstring(Opts.CrossNodeTier));
 
     // --- Resolve driver shim (optional) --------------------------------
     std::filesystem::path ShimDll;
@@ -511,8 +543,17 @@ int SimulationApp::Run(const SimulationOptions& InOpts)
         if (std::filesystem::exists(VkDll, Ec) && std::filesystem::exists(VkManifest, Ec))
         {
             VkLayerDir = BinDir;
-            AddEnv(L"VK_LAYER_PATH",      VkLayerDir.wstring());
-            AddEnv(L"VK_INSTANCE_LAYERS", L"VK_LAYER_DiligentGraphics_LinkedGpuSim");
+            // VK_ADD_LAYER_PATH adds to the loader's search; VK_LAYER_PATH would hide
+            // the installed layers (the child's validation layer among them)
+            auto GetEnv = [](const wchar_t* Name) {
+                wchar_t     Buf[2048];
+                const DWORD Len = ::GetEnvironmentVariableW(Name, Buf, 2048);
+                return Len > 0 && Len < 2048 ? std::wstring{Buf, Len} : std::wstring{};
+            };
+            const std::wstring AddPath = GetEnv(L"VK_ADD_LAYER_PATH");
+            const std::wstring Layers  = GetEnv(L"VK_INSTANCE_LAYERS");
+            AddEnv(L"VK_ADD_LAYER_PATH", AddPath.empty() ? VkLayerDir.wstring() : VkLayerDir.wstring() + L";" + AddPath);
+            AddEnv(L"VK_INSTANCE_LAYERS", Layers.empty() ? std::wstring{L"VK_LAYER_DiligentGraphics_LinkedGpuSim"} : L"VK_LAYER_DiligentGraphics_LinkedGpuSim;" + Layers);
         }
 
         POpts.CreateSuspended = true;
@@ -653,8 +694,15 @@ int SimulationApp::Run(const SimulationOptions& InOpts)
     Sim.Refresh();
     Sink.WriteBlock(GpuInfoConsole::FormatFullReport(Sim));
 
+    const unsigned ValidationErrors = Sink.GetValidationErrorCount();
+    if (ValidationErrors > 0)
+    {
+        std::ostringstream ss;
+        ss << "The shims reported " << ValidationErrors << " validation error(s): the child used the simulated nodes in a way linked hardware rejects.\n";
+        Sink.WriteBlock(ss.str());
+    }
     Sink.Close();
-    return ExitCode;
+    return (ExitCode == 0 && ValidationErrors > 0) ? kExitValidationErrors : ExitCode;
 }
 
 } // namespace SimApp

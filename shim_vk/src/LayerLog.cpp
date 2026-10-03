@@ -67,7 +67,8 @@ void OpenFileIfNeeded()
 {
     if (g_Inited || g_FailedOpen) return;
     const std::wstring LogPath = GetEnvW(L"DILIGENT_SIM_LOG_FILE");
-    g_Verbose = !GetEnvW(L"DILIGENT_SIM_VERBOSE").empty();
+    const std::wstring Verbose = GetEnvW(L"DILIGENT_SIM_VERBOSE");
+    g_Verbose                  = !Verbose.empty() && Verbose != L"0";
     if (!LogPath.empty())
     {
         g_File = _wfsopen(LogPath.c_str(), L"ab", _SH_DENYNO);
