@@ -166,6 +166,8 @@ void PrintHelp()
         "      --cross-node-tier N  D3D12 cross-node sharing tier reported (0..3, default 1).\n"
         "      --refresh SEC      GPU stats refresh interval in seconds\n"
         "                         (0 to disable periodic snapshots). Default: 2.0.\n"
+        "      --cwd DIR          Working directory of the child ('.' = this one).\n"
+        "                         Default: the child's executable directory.\n"
         "  -h, --help             Show this help.\n"
         "\n"
         "EXAMPLES:\n"
@@ -297,6 +299,14 @@ bool ParseCommandLine(int argc, wchar_t** argv,
                 double V = 0.0;
                 if (!ParseDouble(argv[++i], V)) { OutErr = "Invalid value for --refresh."; return false; }
                 OutOpts.RefreshSeconds = V;
+                continue;
+            }
+            if (EqualsAny(Arg, {L"--cwd"}))
+            {
+                if (i + 1 >= argc) { OutErr = "--cwd requires a directory."; return false; }
+                std::error_code Ec;
+                OutOpts.ChildWorkingDir = std::filesystem::absolute(std::filesystem::path{argv[++i]}, Ec);
+                if (Ec || !std::filesystem::is_directory(OutOpts.ChildWorkingDir)) { OutErr = "--cwd: not a directory."; return false; }
                 continue;
             }
             if (std::wcscmp(Arg, L"--") == 0)
@@ -474,7 +484,7 @@ int SimulationApp::Run(const SimulationOptions& InOpts)
     ProcessLauncher::Options POpts;
     POpts.ExePath = ResolvedChild.wstring();
     POpts.Args    = Opts.ChildArgs;
-    POpts.WorkingDir = ResolvedChild.parent_path().wstring();
+    POpts.WorkingDir = Opts.ChildWorkingDir.empty() ? ResolvedChild.parent_path().wstring() : Opts.ChildWorkingDir.wstring();
 
     const SimGpuGroup& Group = Sim.GetGroup();
 

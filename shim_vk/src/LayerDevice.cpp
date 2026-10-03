@@ -23,7 +23,8 @@
 //    vkQueueBindSparse                  VkDeviceGroupBindSparseInfo
 //    vkQueuePresentKHR                  VkDeviceGroupPresentInfoKHR
 //    vkAcquireNextImage2KHR             VkAcquireNextImageInfoKHR::deviceMask
-//    vkGetDeviceGroupPeerMemoryFeatures answered by the layer (one memory: every access works)
+//    vkGetDeviceGroupPeerMemoryFeatures answered by the layer (configured features for device-local
+//    heaps, which have one instance per device; every access for the others)
 //
 //  Mapping memory that has an instance on several devices is reported
 //  (VUID-vkMapMemory-memory-00683): on a real group such memory cannot be mapped.

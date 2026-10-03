@@ -30,6 +30,9 @@ struct SimulationOptions
     std::filesystem::path     ChildExe;
     std::vector<std::wstring> ChildArgs;
 
+    // Working directory of the child. Empty ⇒ the child's executable directory.
+    std::filesystem::path ChildWorkingDir;
+
     // Log destination.  Empty + WriteLogFile==false ⇒ console only.
     std::filesystem::path LogFile;
     bool                  WriteLogFile = true;
