@@ -7,6 +7,7 @@
 
 #include "D3D12DeviceWrapper.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <vector>
 
@@ -20,6 +21,7 @@
 #include <d3d12.h>
 
 #include "D3D12CommandWrappers.hpp"
+#include "D3D12Tracking.hpp"
 #include "D3D12Vtable.hpp"
 #include "NodeMasks.hpp"
 #include "ShimConfig.hpp"
@@ -76,17 +78,104 @@ void OnCommandListCreated(HRESULT hr, void** ppList, D3D12_COMMAND_LIST_TYPE Typ
         WrapCommandList(AsUnknown(ppList), NodeMask);
 }
 
-void OnResourceCreated(HRESULT hr, void** ppResource, const D3D12_HEAP_PROPERTIES& Props)
+// Video memory (local segment) or system memory (non-local) on a discrete adapter
+bool IsLocalHeap(const D3D12_HEAP_PROPERTIES& Props)
 {
-    if (SUCCEEDED(hr) && AsUnknown(ppResource) != nullptr)
-        SetResourceNodeMasks(AsUnknown(ppResource), Props.CreationNodeMask, Props.VisibleNodeMask);
+    switch (Props.Type)
+    {
+        case D3D12_HEAP_TYPE_UPLOAD:
+        case D3D12_HEAP_TYPE_READBACK: return false;
+        case D3D12_HEAP_TYPE_CUSTOM: return Props.MemoryPoolPreference == D3D12_MEMORY_POOL_L1;
+        default: return true;
+    }
 }
 
-void OnPlacedResourceCreated(HRESULT hr, void** ppResource, ID3D12Heap* pHeap)
+D3D12_RESOURCE_DESC ToResourceDesc(const D3D12_RESOURCE_DESC& Desc) { return Desc; }
+D3D12_RESOURCE_DESC ToResourceDesc(const D3D12_RESOURCE_DESC1& Desc)
 {
-    UINT Creation = 0, Visible = 0;
-    if (SUCCEEDED(hr) && AsUnknown(ppResource) != nullptr && GetResourceNodeMasks(pHeap, Creation, Visible))
-        SetResourceNodeMasks(AsUnknown(ppResource), Creation, Visible);
+    D3D12_RESOURCE_DESC D{};
+    D.Dimension        = Desc.Dimension;
+    D.Alignment        = Desc.Alignment;
+    D.Width            = Desc.Width;
+    D.Height           = Desc.Height;
+    D.DepthOrArraySize = Desc.DepthOrArraySize;
+    D.MipLevels        = Desc.MipLevels;
+    D.Format           = Desc.Format;
+    D.SampleDesc       = Desc.SampleDesc;
+    D.Layout           = Desc.Layout;
+    D.Flags            = Desc.Flags;
+    return D;
+}
+
+// Address range of a buffer (views and root arguments refer to buffers by address)
+template <typename DescType>
+void SetBufferRange(IUnknown* pResource, const DescType* pDesc, ResourceInfo& Info)
+{
+    if (pDesc == nullptr || pDesc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+        return;
+    ID3D12Resource* pD3D12Resource = nullptr;
+    if (SUCCEEDED(pResource->QueryInterface(IID_PPV_ARGS(&pD3D12Resource))))
+    {
+        Info.VA   = pD3D12Resource->GetGPUVirtualAddress();
+        Info.Size = pDesc->Width;
+        pD3D12Resource->Release();
+    }
+}
+
+template <typename DescType>
+void OnResourceCreated(ID3D12Device* This, HRESULT hr, void** ppResource, const D3D12_HEAP_PROPERTIES& Props, const DescType* pDesc)
+{
+    IUnknown* pResource = AsUnknown(ppResource);
+    if (FAILED(hr) || pResource == nullptr)
+        return;
+    ResourceInfo Info;
+    Info.Creation = NormalizeSingleNode(Props.CreationNodeMask);
+    Info.Visible  = Props.VisibleNodeMask != 0 ? Props.VisibleNodeMask : Info.Creation;
+    Info.Local    = IsLocalHeap(Props);
+    if (pDesc != nullptr)
+    {
+        // Memory of a committed resource is charged to its creation node
+        const D3D12_RESOURCE_DESC Desc = ToResourceDesc(*pDesc);
+        Info.Bytes                     = This->GetResourceAllocationInfo(0, 1, &Desc).SizeInBytes;
+    }
+    SetBufferRange(pResource, pDesc, Info);
+    RegisterResource(pResource, Info);
+}
+
+void OnHeapCreated(HRESULT hr, void** ppHeap, const D3D12_HEAP_DESC& Desc)
+{
+    IUnknown* pHeap = AsUnknown(ppHeap);
+    if (FAILED(hr) || pHeap == nullptr)
+        return;
+    ResourceInfo Info;
+    Info.Creation = NormalizeSingleNode(Desc.Properties.CreationNodeMask);
+    Info.Visible  = Desc.Properties.VisibleNodeMask != 0 ? Desc.Properties.VisibleNodeMask : Info.Creation;
+    Info.Local    = IsLocalHeap(Desc.Properties);
+    Info.Bytes    = Desc.SizeInBytes;
+    RegisterResource(pHeap, Info);
+}
+
+// A placed resource lives where its heap does (the heap carries the memory charge)
+template <typename DescType>
+void OnPlacedResourceCreated(HRESULT hr, void** ppResource, ID3D12Heap* pHeap, const DescType* pDesc)
+{
+    IUnknown*    pResource = AsUnknown(ppResource);
+    ResourceInfo HeapInfo;
+    if (FAILED(hr) || pResource == nullptr || !FindResource(pHeap, HeapInfo))
+        return;
+    ResourceInfo Info;
+    Info.Creation = HeapInfo.Creation;
+    Info.Visible  = HeapInfo.Visible;
+    Info.Local    = HeapInfo.Local;
+    SetBufferRange(pResource, pDesc, Info);
+    RegisterResource(pResource, Info);
+}
+
+// Pipeline states, root signatures: the nodes they may be used on
+void OnNodeSetObjectCreated(HRESULT hr, void** ppObject, UINT NodeMask)
+{
+    if (SUCCEEDED(hr) && AsUnknown(ppObject) != nullptr)
+        SetObjectNodeMask(AsUnknown(ppObject), NodeMask);
 }
 
 // ---------------------------------------------------------------------------
@@ -238,7 +327,9 @@ HRESULT STDMETHODCALLTYPE Hook_CreateGraphicsPipelineState(ID3D12Device* This, c
         return E_INVALIDARG;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC Local = *pDesc;
     Local.NodeMask                           = ToPhysicalMask(pDesc->NodeMask);
-    return Orig<PFN>(This, kSlot_CreateGraphicsPipelineState)(This, &Local, riid, ppPSO);
+    const HRESULT hr                         = Orig<PFN>(This, kSlot_CreateGraphicsPipelineState)(This, &Local, riid, ppPSO);
+    OnNodeSetObjectCreated(hr, ppPSO, pDesc->NodeMask);
+    return hr;
 }
 
 HRESULT STDMETHODCALLTYPE Hook_CreateComputePipelineState(ID3D12Device* This, const D3D12_COMPUTE_PIPELINE_STATE_DESC* pDesc, REFIID riid, void** ppPSO)
@@ -250,24 +341,32 @@ HRESULT STDMETHODCALLTYPE Hook_CreateComputePipelineState(ID3D12Device* This, co
         return E_INVALIDARG;
     D3D12_COMPUTE_PIPELINE_STATE_DESC Local = *pDesc;
     Local.NodeMask                          = ToPhysicalMask(pDesc->NodeMask);
-    return Orig<PFN>(This, kSlot_CreateComputePipelineState)(This, &Local, riid, ppPSO);
+    const HRESULT hr                        = Orig<PFN>(This, kSlot_CreateComputePipelineState)(This, &Local, riid, ppPSO);
+    OnNodeSetObjectCreated(hr, ppPSO, pDesc->NodeMask);
+    return hr;
 }
 
 HRESULT STDMETHODCALLTYPE Hook_CreatePipelineState(ID3D12Device* This, const D3D12_PIPELINE_STATE_STREAM_DESC* pDesc, REFIID riid, void** ppPSO)
 {
     using PFN = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
     std::vector<UINT*> NodeMasks;
-    MaskPatch          Patch;
-    if (pDesc != nullptr && pDesc->pPipelineStateSubobjectStream != nullptr && FindStreamNodeMasks(*pDesc, NodeMasks))
+    UINT               StreamNodeMask = 0; // no NODE_MASK subobject: node 0
     {
-        for (UINT* pMask : NodeMasks)
+        MaskPatch Patch;
+        if (pDesc != nullptr && pDesc->pPipelineStateSubobjectStream != nullptr && FindStreamNodeMasks(*pDesc, NodeMasks))
         {
-            if (!CheckNodeSetMask("CreatePipelineState", "NODE_MASK subobject", *pMask))
-                return E_INVALIDARG;
-            Patch.Set(pMask, ToPhysicalMask(*pMask));
+            for (UINT* pMask : NodeMasks)
+            {
+                if (!CheckNodeSetMask("CreatePipelineState", "NODE_MASK subobject", *pMask))
+                    return E_INVALIDARG;
+                StreamNodeMask = *pMask;
+                Patch.Set(pMask, ToPhysicalMask(*pMask));
+            }
         }
+        const HRESULT hr = Orig<PFN>(This, kSlot_CreatePipelineState)(This, pDesc, riid, ppPSO);
+        OnNodeSetObjectCreated(hr, ppPSO, StreamNodeMask);
+        return hr;
     }
-    return Orig<PFN>(This, kSlot_CreatePipelineState)(This, pDesc, riid, ppPSO);
 }
 
 HRESULT STDMETHODCALLTYPE Hook_CreateStateObject(ID3D12Device* This, const D3D12_STATE_OBJECT_DESC* pDesc, REFIID riid, void** ppStateObject)
@@ -384,7 +483,24 @@ HRESULT STDMETHODCALLTYPE Hook_CreateDescriptorHeap(ID3D12Device* This, const D3
         return E_INVALIDARG;
     D3D12_DESCRIPTOR_HEAP_DESC Local = *pDesc;
     Local.NodeMask                   = ToPhysicalMask(pDesc->NodeMask);
-    return Orig<PFN>(This, kSlot_CreateDescriptorHeap)(This, &Local, riid, ppHeap);
+    const HRESULT hr                 = Orig<PFN>(This, kSlot_CreateDescriptorHeap)(This, &Local, riid, ppHeap);
+    IUnknown*     pHeapUnk           = AsUnknown(ppHeap);
+    ID3D12DescriptorHeap* pHeap      = nullptr;
+    if (SUCCEEDED(hr) && pHeapUnk != nullptr && SUCCEEDED(pHeapUnk->QueryInterface(IID_PPV_ARGS(&pHeap))))
+    {
+        // Shader-visible heaps belong to one node; descriptors are tracked to find the resources views refer to
+        SetObjectNodeMask(pHeapUnk, pDesc->NodeMask);
+        DescriptorHeapInfo Info;
+        Info.CpuStart  = pHeap->GetCPUDescriptorHandleForHeapStart().ptr;
+        Info.GpuStart  = (pDesc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0 ? pHeap->GetGPUDescriptorHandleForHeapStart().ptr : 0;
+        Info.Count     = pDesc->NumDescriptors;
+        Info.Increment = This->GetDescriptorHandleIncrementSize(pDesc->Type);
+        Info.Type      = pDesc->Type;
+        Info.NodeMask  = NormalizeSingleNode(pDesc->NodeMask);
+        RegisterDescriptorHeap(pHeapUnk, Info);
+        pHeap->Release();
+    }
+    return hr;
 }
 
 HRESULT STDMETHODCALLTYPE Hook_CreateRootSignature(ID3D12Device* This, UINT NodeMask, const void* pBlob, SIZE_T BlobSize, REFIID riid, void** ppRootSignature)
@@ -392,7 +508,11 @@ HRESULT STDMETHODCALLTYPE Hook_CreateRootSignature(ID3D12Device* This, UINT Node
     using PFN = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, const void*, SIZE_T, REFIID, void**);
     if (!CheckNodeSetMask("CreateRootSignature", "nodeMask", NodeMask))
         return E_INVALIDARG;
-    return Orig<PFN>(This, kSlot_CreateRootSignature)(This, ToPhysicalMask(NodeMask), pBlob, BlobSize, riid, ppRootSignature);
+    const HRESULT hr = Orig<PFN>(This, kSlot_CreateRootSignature)(This, ToPhysicalMask(NodeMask), pBlob, BlobSize, riid, ppRootSignature);
+    OnNodeSetObjectCreated(hr, ppRootSignature, NodeMask);
+    if (SUCCEEDED(hr) && AsUnknown(ppRootSignature) != nullptr)
+        RegisterRootSignature(AsUnknown(ppRootSignature), pBlob, BlobSize); // table layouts, for draw-time checks
+    return hr;
 }
 
 D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE Hook_GetResourceAllocationInfo(ID3D12Device* This, D3D12_RESOURCE_ALLOCATION_INFO* pRetVal, UINT VisibleMask,
@@ -444,7 +564,7 @@ HRESULT STDMETHODCALLTYPE Hook_CreateCommittedResource(ID3D12Device* This, const
         return E_INVALIDARG;
     const D3D12_HEAP_PROPERTIES Local = PhysicalHeapProperties(*pProps);
     const HRESULT               hr    = Orig<PFN>(This, kSlot_CreateCommittedResource)(This, &Local, Flags, pDesc, State, pClear, riid, ppResource);
-    OnResourceCreated(hr, ppResource, *pProps);
+    OnResourceCreated(This, hr, ppResource, *pProps, pDesc);
     return hr;
 }
 
@@ -460,7 +580,7 @@ HRESULT STDMETHODCALLTYPE Hook_CreateCommittedResource1(ID3D12Device* This, cons
         return E_INVALIDARG;
     const D3D12_HEAP_PROPERTIES Local = PhysicalHeapProperties(*pProps);
     const HRESULT               hr    = Orig<PFN>(This, kSlot_CreateCommittedResource1)(This, &Local, Flags, pDesc, State, pClear, pSession, riid, ppResource);
-    OnResourceCreated(hr, ppResource, *pProps);
+    OnResourceCreated(This, hr, ppResource, *pProps, pDesc);
     return hr;
 }
 
@@ -476,7 +596,7 @@ HRESULT STDMETHODCALLTYPE Hook_CreateCommittedResource2(ID3D12Device* This, cons
         return E_INVALIDARG;
     const D3D12_HEAP_PROPERTIES Local = PhysicalHeapProperties(*pProps);
     const HRESULT               hr    = Orig<PFN>(This, kSlot_CreateCommittedResource2)(This, &Local, Flags, pDesc, State, pClear, pSession, riid, ppResource);
-    OnResourceCreated(hr, ppResource, *pProps);
+    OnResourceCreated(This, hr, ppResource, *pProps, pDesc);
     return hr;
 }
 
@@ -492,7 +612,7 @@ HRESULT STDMETHODCALLTYPE Hook_CreateCommittedResource3(ID3D12Device* This, cons
         return E_INVALIDARG;
     const D3D12_HEAP_PROPERTIES Local = PhysicalHeapProperties(*pProps);
     const HRESULT               hr    = Orig<PFN>(This, kSlot_CreateCommittedResource3)(This, &Local, Flags, pDesc, Layout, pClear, pSession, NumCastableFormats, pCastableFormats, riid, ppResource);
-    OnResourceCreated(hr, ppResource, *pProps);
+    OnResourceCreated(This, hr, ppResource, *pProps, pDesc);
     return hr;
 }
 
@@ -506,7 +626,7 @@ HRESULT STDMETHODCALLTYPE Hook_CreateHeap(ID3D12Device* This, const D3D12_HEAP_D
     D3D12_HEAP_DESC Local = *pDesc;
     Local.Properties      = PhysicalHeapProperties(pDesc->Properties);
     const HRESULT hr      = Orig<PFN>(This, kSlot_CreateHeap)(This, &Local, riid, ppHeap);
-    OnResourceCreated(hr, ppHeap, pDesc->Properties);
+    OnHeapCreated(hr, ppHeap, *pDesc);
     return hr;
 }
 
@@ -520,7 +640,7 @@ HRESULT STDMETHODCALLTYPE Hook_CreateHeap1(ID3D12Device* This, const D3D12_HEAP_
     D3D12_HEAP_DESC Local = *pDesc;
     Local.Properties      = PhysicalHeapProperties(pDesc->Properties);
     const HRESULT hr      = Orig<PFN>(This, kSlot_CreateHeap1)(This, &Local, pSession, riid, ppHeap);
-    OnResourceCreated(hr, ppHeap, pDesc->Properties);
+    OnHeapCreated(hr, ppHeap, *pDesc);
     return hr;
 }
 
@@ -529,7 +649,7 @@ HRESULT STDMETHODCALLTYPE Hook_CreatePlacedResource(ID3D12Device* This, ID3D12He
 {
     using PFN = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Heap*, UINT64, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, REFIID, void**);
     const HRESULT hr = Orig<PFN>(This, kSlot_CreatePlacedResource)(This, pHeap, Offset, pDesc, State, pClear, riid, ppResource);
-    OnPlacedResourceCreated(hr, ppResource, pHeap);
+    OnPlacedResourceCreated(hr, ppResource, pHeap, pDesc);
     return hr;
 }
 
@@ -538,7 +658,7 @@ HRESULT STDMETHODCALLTYPE Hook_CreatePlacedResource1(ID3D12Device* This, ID3D12H
 {
     using PFN = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Heap*, UINT64, const D3D12_RESOURCE_DESC1*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, REFIID, void**);
     const HRESULT hr = Orig<PFN>(This, kSlot_CreatePlacedResource1)(This, pHeap, Offset, pDesc, State, pClear, riid, ppResource);
-    OnPlacedResourceCreated(hr, ppResource, pHeap);
+    OnPlacedResourceCreated(hr, ppResource, pHeap, pDesc);
     return hr;
 }
 
@@ -548,7 +668,7 @@ HRESULT STDMETHODCALLTYPE Hook_CreatePlacedResource2(ID3D12Device* This, ID3D12H
     using PFN = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Heap*, UINT64, const D3D12_RESOURCE_DESC1*, D3D12_BARRIER_LAYOUT, const D3D12_CLEAR_VALUE*, UINT32,
                                             const DXGI_FORMAT*, REFIID, void**);
     const HRESULT hr = Orig<PFN>(This, kSlot_CreatePlacedResource2)(This, pHeap, Offset, pDesc, Layout, pClear, NumCastableFormats, pCastableFormats, riid, ppResource);
-    OnPlacedResourceCreated(hr, ppResource, pHeap);
+    OnPlacedResourceCreated(hr, ppResource, pHeap, pDesc);
     return hr;
 }
 
@@ -561,7 +681,10 @@ HRESULT STDMETHODCALLTYPE Hook_CreateQueryHeap(ID3D12Device* This, const D3D12_Q
         return E_INVALIDARG;
     D3D12_QUERY_HEAP_DESC Local = *pDesc;
     Local.NodeMask              = ToPhysicalMask(pDesc->NodeMask);
-    return Orig<PFN>(This, kSlot_CreateQueryHeap)(This, &Local, riid, ppHeap);
+    const HRESULT hr            = Orig<PFN>(This, kSlot_CreateQueryHeap)(This, &Local, riid, ppHeap);
+    if (SUCCEEDED(hr) && AsUnknown(ppHeap) != nullptr)
+        SetObjectNodeMask(AsUnknown(ppHeap), pDesc->NodeMask); // queries are recorded on lists of this node only
+    return hr;
 }
 
 HRESULT STDMETHODCALLTYPE Hook_CreateCommandSignature(ID3D12Device* This, const D3D12_COMMAND_SIGNATURE_DESC* pDesc, ID3D12RootSignature* pRootSignature, REFIID riid,
@@ -574,7 +697,111 @@ HRESULT STDMETHODCALLTYPE Hook_CreateCommandSignature(ID3D12Device* This, const 
         return E_INVALIDARG;
     D3D12_COMMAND_SIGNATURE_DESC Local = *pDesc;
     Local.NodeMask                     = ToPhysicalMask(pDesc->NodeMask);
-    return Orig<PFN>(This, kSlot_CreateCommandSignature)(This, &Local, pRootSignature, riid, ppSignature);
+    const HRESULT hr                   = Orig<PFN>(This, kSlot_CreateCommandSignature)(This, &Local, pRootSignature, riid, ppSignature);
+    if (SUCCEEDED(hr) && AsUnknown(ppSignature) != nullptr)
+    {
+        bool Compute = false;
+        for (UINT i = 0; pDesc->pArgumentDescs != nullptr && i < pDesc->NumArgumentDescs; ++i)
+            Compute = Compute || pDesc->pArgumentDescs[i].Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+        RegisterCommandSignature(AsUnknown(ppSignature), pDesc->NodeMask, Compute);
+    }
+    return hr;
+}
+
+// ---- Descriptors: which resource (or address) each CPU descriptor refers to ----
+
+void STDMETHODCALLTYPE Hook_CreateConstantBufferView(ID3D12Device* This, const D3D12_CONSTANT_BUFFER_VIEW_DESC* pDesc, D3D12_CPU_DESCRIPTOR_HANDLE Dest)
+{
+    using PFN = void(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_CONSTANT_BUFFER_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
+    Orig<PFN>(This, kSlot_CreateConstantBufferView)(This, pDesc, Dest);
+    DescriptorInfo Info;
+    Info.Kind = DESCRIPTOR_CBV;
+    Info.VA   = pDesc != nullptr ? pDesc->BufferLocation : 0;
+    SetDescriptor(Dest.ptr, Info);
+}
+
+void STDMETHODCALLTYPE Hook_CreateShaderResourceView(ID3D12Device* This, ID3D12Resource* pResource, const D3D12_SHADER_RESOURCE_VIEW_DESC* pDesc, D3D12_CPU_DESCRIPTOR_HANDLE Dest)
+{
+    using PFN = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_SHADER_RESOURCE_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
+    Orig<PFN>(This, kSlot_CreateShaderResourceView)(This, pResource, pDesc, Dest);
+    DescriptorInfo Info;
+    Info.Kind      = DESCRIPTOR_SRV;
+    Info.pResource = pResource;
+    if (pDesc != nullptr && pDesc->ViewDimension == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE)
+        Info.VA = pDesc->RaytracingAccelerationStructure.Location;
+    SetDescriptor(Dest.ptr, Info);
+}
+
+void STDMETHODCALLTYPE Hook_CreateUnorderedAccessView(ID3D12Device* This, ID3D12Resource* pResource, ID3D12Resource* pCounter, const D3D12_UNORDERED_ACCESS_VIEW_DESC* pDesc,
+                                                      D3D12_CPU_DESCRIPTOR_HANDLE Dest)
+{
+    using PFN = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, ID3D12Resource*, const D3D12_UNORDERED_ACCESS_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
+    Orig<PFN>(This, kSlot_CreateUnorderedAccessView)(This, pResource, pCounter, pDesc, Dest);
+    DescriptorInfo Info;
+    Info.Kind      = DESCRIPTOR_UAV;
+    Info.pResource = pResource;
+    Info.pCounter  = pCounter;
+    SetDescriptor(Dest.ptr, Info);
+}
+
+void STDMETHODCALLTYPE Hook_CreateRenderTargetView(ID3D12Device* This, ID3D12Resource* pResource, const D3D12_RENDER_TARGET_VIEW_DESC* pDesc, D3D12_CPU_DESCRIPTOR_HANDLE Dest)
+{
+    using PFN = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_RENDER_TARGET_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
+    Orig<PFN>(This, kSlot_CreateRenderTargetView)(This, pResource, pDesc, Dest);
+    DescriptorInfo Info;
+    Info.Kind      = DESCRIPTOR_RTV;
+    Info.pResource = pResource;
+    SetDescriptor(Dest.ptr, Info);
+}
+
+void STDMETHODCALLTYPE Hook_CreateDepthStencilView(ID3D12Device* This, ID3D12Resource* pResource, const D3D12_DEPTH_STENCIL_VIEW_DESC* pDesc, D3D12_CPU_DESCRIPTOR_HANDLE Dest)
+{
+    using PFN = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_DEPTH_STENCIL_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
+    Orig<PFN>(This, kSlot_CreateDepthStencilView)(This, pResource, pDesc, Dest);
+    DescriptorInfo Info;
+    Info.Kind      = DESCRIPTOR_DSV;
+    Info.pResource = pResource;
+    SetDescriptor(Dest.ptr, Info);
+}
+
+void STDMETHODCALLTYPE Hook_CopyDescriptors(ID3D12Device* This, UINT NumDstRanges, const D3D12_CPU_DESCRIPTOR_HANDLE* pDstStarts, const UINT* pDstSizes, UINT NumSrcRanges,
+                                            const D3D12_CPU_DESCRIPTOR_HANDLE* pSrcStarts, const UINT* pSrcSizes, D3D12_DESCRIPTOR_HEAP_TYPE Type)
+{
+    using PFN = void(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, const UINT*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, const UINT*,
+                                         D3D12_DESCRIPTOR_HEAP_TYPE);
+    Orig<PFN>(This, kSlot_CopyDescriptors)(This, NumDstRanges, pDstStarts, pDstSizes, NumSrcRanges, pSrcStarts, pSrcSizes, Type);
+    if (pDstStarts == nullptr || pSrcStarts == nullptr)
+        return;
+    // Walk both range lists one descriptor at a time (a null size array means ranges of one)
+    const UINT Increment = This->GetDescriptorHandleIncrementSize(Type);
+    UINT       Dst = 0, DstPos = 0, Src = 0, SrcPos = 0;
+    while (Dst < NumDstRanges && Src < NumSrcRanges)
+    {
+        const UINT DstSize = pDstSizes != nullptr ? pDstSizes[Dst] : 1;
+        const UINT SrcSize = pSrcSizes != nullptr ? pSrcSizes[Src] : 1;
+        if (DstPos >= DstSize)
+        {
+            ++Dst, DstPos = 0;
+            continue;
+        }
+        if (SrcPos >= SrcSize)
+        {
+            ++Src, SrcPos = 0;
+            continue;
+        }
+        const UINT Count = (std::min)(DstSize - DstPos, SrcSize - SrcPos);
+        D3D12Sim::CopyDescriptors(pDstStarts[Dst].ptr + SIZE_T{DstPos} * Increment, pSrcStarts[Src].ptr + SIZE_T{SrcPos} * Increment, Count, Increment);
+        DstPos += Count;
+        SrcPos += Count;
+    }
+}
+
+void STDMETHODCALLTYPE Hook_CopyDescriptorsSimple(ID3D12Device* This, UINT NumDescriptors, D3D12_CPU_DESCRIPTOR_HANDLE Dst, D3D12_CPU_DESCRIPTOR_HANDLE Src,
+                                                  D3D12_DESCRIPTOR_HEAP_TYPE Type)
+{
+    using PFN = void(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_DESCRIPTOR_HEAP_TYPE);
+    Orig<PFN>(This, kSlot_CopyDescriptorsSimple)(This, NumDescriptors, Dst, Src, Type);
+    D3D12Sim::CopyDescriptors(Dst.ptr, Src.ptr, NumDescriptors, This->GetDescriptorHandleIncrementSize(Type));
 }
 
 void PatchDeviceVtable(void** Slots, size_t NumSlots)
@@ -598,6 +825,13 @@ void PatchDeviceVtable(void** Slots, size_t NumSlots)
     Set(kSlot_CreatePlacedResource, &Hook_CreatePlacedResource);
     Set(kSlot_CreateQueryHeap, &Hook_CreateQueryHeap);
     Set(kSlot_CreateCommandSignature, &Hook_CreateCommandSignature);
+    Set(kSlot_CreateConstantBufferView, &Hook_CreateConstantBufferView);
+    Set(kSlot_CreateShaderResourceView, &Hook_CreateShaderResourceView);
+    Set(kSlot_CreateUnorderedAccessView, &Hook_CreateUnorderedAccessView);
+    Set(kSlot_CreateRenderTargetView, &Hook_CreateRenderTargetView);
+    Set(kSlot_CreateDepthStencilView, &Hook_CreateDepthStencilView);
+    Set(kSlot_CopyDescriptors, &Hook_CopyDescriptors);
+    Set(kSlot_CopyDescriptorsSimple, &Hook_CopyDescriptorsSimple);
     // Methods of derived interfaces: the entries exist only if the object
     // implements the interface; patching garbage entries of a shorter vtable is
     // harmless, since nothing can call them without that interface

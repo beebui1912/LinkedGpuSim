@@ -11,6 +11,7 @@
 #include <cstdarg>
 #include <cstdio>
 
+#include "D3D12Tracking.hpp"
 #include "ShimConfig.hpp"
 #include "ShimLog.hpp"
 
@@ -25,8 +26,6 @@ constexpr unsigned    kMaxReportedErrors = 50;
 
 // {5B8B6B1E-6C1F-4F34-9D3B-2C1E7A4C0D11}: UINT, simulated node mask of a queue or command list
 constexpr GUID kNodeMaskGuid = {0x5b8b6b1e, 0x6c1f, 0x4f34, {0x9d, 0x3b, 0x2c, 0x1e, 0x7a, 0x4c, 0x0d, 0x11}};
-// {5B8B6B1E-6C1F-4F34-9D3B-2C1E7A4C0D12}: UINT[2], simulated creation/visible masks of a heap or resource
-constexpr GUID kHeapMasksGuid = {0x5b8b6b1e, 0x6c1f, 0x4f34, {0x9d, 0x3b, 0x2c, 0x1e, 0x7a, 0x4c, 0x0d, 0x12}};
 
 bool IsPowerOfTwo(UINT V) { return V != 0 && (V & (V - 1)) == 0; }
 
@@ -104,6 +103,41 @@ bool CheckHeapNodeMasks(const char* Api, UINT CreationNodeMask, UINT VisibleNode
         ReportValidationError("%s: VisibleNodeMask 0x%X must include the creation node (CreationNodeMask 0x%X)", Api, VisibleNodeMask, CreationNodeMask);
         return false;
     }
+    if (ValidationEnabled() && CrossNodeSharingLevel() == 0 && VisibleNodeMask != 0 && VisibleNodeMask != NormalizeSingleNode(CreationNodeMask))
+    {
+        ReportValidationError("%s: VisibleNodeMask 0x%X names other nodes, but the adapter does not support cross-node sharing (tier 0)", Api, VisibleNodeMask);
+        return false;
+    }
+    return true;
+}
+
+UINT CrossNodeSharingLevel()
+{
+    const unsigned Tier = GetConfig().CrossNodeSharingTier;
+    return Tier > 3 ? 1u : Tier;
+}
+
+bool CheckResourceAccess(const char* Api, const char* Role, UINT ListNodeMask, const void* pResource, ACCESS_KIND Kind)
+{
+    UINT Creation = 0, Visible = 0;
+    if (!ValidationEnabled() || pResource == nullptr || !GetResourceNodeMasks(pResource, Creation, Visible))
+        return true;
+    UINT ListNode = 0;
+    while (ListNode < 31 && (ListNodeMask & (1u << ListNode)) == 0)
+        ++ListNode;
+    if ((Visible & ListNodeMask) == 0)
+    {
+        ReportValidationError("%s: the %s resource %p (CreationNodeMask 0x%X, VisibleNodeMask 0x%X) is not visible to node %u",
+                              Api, Role, pResource, Creation, Visible, ListNode);
+        return false;
+    }
+    if (Creation != ListNodeMask && Kind != ACCESS_COPY && CrossNodeSharingLevel() < 2)
+    {
+        ReportValidationError("%s: node %u uses the %s resource %p of another node (CreationNodeMask 0x%X) %s; cross-node sharing tier %u only allows copies",
+                              Api, ListNode, Role, pResource, Creation, Kind == ACCESS_TARGET ? "as a render target or depth buffer" : "through a view, root argument or buffer binding",
+                              CrossNodeSharingLevel());
+        return false;
+    }
     return true;
 }
 
@@ -120,18 +154,20 @@ bool GetObjectNodeMask(IUnknown* pObject, UINT& NodeMask)
 
 void SetResourceNodeMasks(IUnknown* pObject, UINT CreationNodeMask, UINT VisibleNodeMask)
 {
-    const UINT Creation   = NormalizeSingleNode(CreationNodeMask);
-    const UINT Masks[2] = {Creation, VisibleNodeMask != 0 ? VisibleNodeMask : Creation};
-    SetData(pObject, kHeapMasksGuid, sizeof(Masks), Masks);
+    ResourceInfo Info;
+    FindResource(pObject, Info); // keeps address and memory charge if already registered
+    Info.Creation = NormalizeSingleNode(CreationNodeMask);
+    Info.Visible  = VisibleNodeMask != 0 ? VisibleNodeMask : Info.Creation;
+    RegisterResource(pObject, Info);
 }
 
-bool GetResourceNodeMasks(IUnknown* pObject, UINT& CreationNodeMask, UINT& VisibleNodeMask)
+bool GetResourceNodeMasks(const void* pObject, UINT& CreationNodeMask, UINT& VisibleNodeMask)
 {
-    UINT Masks[2] = {};
-    if (!GetData(pObject, kHeapMasksGuid, sizeof(Masks), Masks))
+    ResourceInfo Info;
+    if (!FindResource(pObject, Info))
         return false;
-    CreationNodeMask = Masks[0];
-    VisibleNodeMask  = Masks[1];
+    CreationNodeMask = Info.Creation;
+    VisibleNodeMask  = Info.Visible;
     return true;
 }
 

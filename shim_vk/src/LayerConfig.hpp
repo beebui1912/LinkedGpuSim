@@ -26,6 +26,20 @@ struct LayerConfig
     bool     Validate    = true;  // DILIGENT_SIM_VALIDATION=0 turns the checks off
     bool     HasHostLuid = false; // DILIGENT_SIM_HOST_ADAPTER_LUID ("0xHIGH_0xLOW")
     uint8_t  HostLuid[VK_LUID_SIZE] = {};
+
+    // VkPhysicalDeviceGroupProperties::subsetAllocation (DILIGENT_SIM_VK_SUBSET_ALLOCATION, default 1).
+    // Without it, every allocation has an instance on every device whatever its device mask.
+    bool SubsetAllocation = true;
+
+    // vkGetDeviceGroupPeerMemoryFeatures for device-local heaps
+    // (DILIGENT_SIM_VK_PEER_MEMORY_FEATURES, default COPY_SRC | COPY_DST | GENERIC_DST:
+    // copies in both directions and shader/attachment writes, no generic reads of peer memory)
+    VkPeerMemoryFeatureFlags PeerMemoryFeatures = VK_PEER_MEMORY_FEATURE_COPY_SRC_BIT | VK_PEER_MEMORY_FEATURE_COPY_DST_BIT | VK_PEER_MEMORY_FEATURE_GENERIC_DST_BIT;
+
+    // Cosmetic per-node identities (DILIGENT_SIM_VIRTUAL_ADAPTERS=1): "[Simulated Node k]" in the
+    // device name and device-local heaps divided by N. Off by default: the devices of a real
+    // group are identical.
+    bool VirtualIdentities = false;
 };
 
 const LayerConfig& GetConfig();

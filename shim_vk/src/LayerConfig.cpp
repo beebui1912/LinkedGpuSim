@@ -54,6 +54,14 @@ void InitConfig()
     const std::wstring Validate = GetEnvW(L"DILIGENT_SIM_VALIDATION");
     g_Config.Validate           = Validate.empty() || std::wcstoul(Validate.c_str(), nullptr, 10) != 0;
 
+    const std::wstring Subset = GetEnvW(L"DILIGENT_SIM_VK_SUBSET_ALLOCATION");
+    g_Config.SubsetAllocation = Subset.empty() || std::wcstoul(Subset.c_str(), nullptr, 0) != 0;
+    const std::wstring Peer   = GetEnvW(L"DILIGENT_SIM_VK_PEER_MEMORY_FEATURES");
+    if (!Peer.empty())
+        g_Config.PeerMemoryFeatures = static_cast<VkPeerMemoryFeatureFlags>(std::wcstoul(Peer.c_str(), nullptr, 0)) | VK_PEER_MEMORY_FEATURE_COPY_DST_BIT; // required by the spec
+    const std::wstring Virtual  = GetEnvW(L"DILIGENT_SIM_VIRTUAL_ADAPTERS");
+    g_Config.VirtualIdentities  = !Virtual.empty() && std::wcstoul(Virtual.c_str(), nullptr, 10) != 0;
+
     // "0xHIGH_0xLOW"; the LUID bytes are the Windows LUID struct (LowPart first)
     const std::wstring Luid = GetEnvW(L"DILIGENT_SIM_HOST_ADAPTER_LUID");
     const size_t       Sep  = Luid.find(L'_');

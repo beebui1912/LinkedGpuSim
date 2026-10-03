@@ -26,6 +26,13 @@ constexpr int kSlot_CreateCommandList           = 12;
 constexpr int kSlot_CheckFeatureSupport         = 13;
 constexpr int kSlot_CreateDescriptorHeap        = 14;
 constexpr int kSlot_CreateRootSignature         = 16;
+constexpr int kSlot_CreateConstantBufferView    = 17;
+constexpr int kSlot_CreateShaderResourceView    = 18;
+constexpr int kSlot_CreateUnorderedAccessView   = 19;
+constexpr int kSlot_CreateRenderTargetView      = 20;
+constexpr int kSlot_CreateDepthStencilView      = 21;
+constexpr int kSlot_CopyDescriptors             = 23;
+constexpr int kSlot_CopyDescriptorsSimple       = 24;
 constexpr int kSlot_GetResourceAllocationInfo   = 25; // returns a struct (hidden pointer)
 constexpr int kSlot_GetCustomHeapProperties     = 26; // returns a struct (hidden pointer)
 constexpr int kSlot_CreateCommittedResource     = 27;
@@ -54,9 +61,57 @@ constexpr int kQueueSlot_ExecuteCommandLists = 10;
 constexpr int kQueueSlot_GetDesc             = 18; // returns a struct (hidden pointer)
 
 // ---- ID3D12GraphicsCommandList (ID3D12CommandList::GetType is 8) ----------
-constexpr int kListSlot_CopyBufferRegion  = 15;
-constexpr int kListSlot_CopyTextureRegion = 16;
-constexpr int kListSlot_CopyResource      = 17;
+constexpr int kListSlot_Reset                              = 10;
+constexpr int kListSlot_DrawInstanced                      = 12;
+constexpr int kListSlot_DrawIndexedInstanced               = 13;
+constexpr int kListSlot_Dispatch                           = 14;
+constexpr int kListSlot_CopyBufferRegion                   = 15;
+constexpr int kListSlot_CopyTextureRegion                  = 16;
+constexpr int kListSlot_CopyResource                       = 17;
+constexpr int kListSlot_CopyTiles                          = 18;
+constexpr int kListSlot_ResolveSubresource                 = 19;
+constexpr int kListSlot_SetPipelineState                   = 25;
+constexpr int kListSlot_ExecuteBundle                      = 27;
+constexpr int kListSlot_SetDescriptorHeaps                 = 28;
+constexpr int kListSlot_SetComputeRootSignature            = 29;
+constexpr int kListSlot_SetGraphicsRootSignature           = 30;
+constexpr int kListSlot_SetComputeRootDescriptorTable      = 31;
+constexpr int kListSlot_SetGraphicsRootDescriptorTable     = 32;
+constexpr int kListSlot_SetComputeRootConstantBufferView   = 37;
+constexpr int kListSlot_SetGraphicsRootConstantBufferView  = 38;
+constexpr int kListSlot_SetComputeRootShaderResourceView   = 39;
+constexpr int kListSlot_SetGraphicsRootShaderResourceView  = 40;
+constexpr int kListSlot_SetComputeRootUnorderedAccessView  = 41;
+constexpr int kListSlot_SetGraphicsRootUnorderedAccessView = 42;
+constexpr int kListSlot_IASetIndexBuffer                   = 43;
+constexpr int kListSlot_IASetVertexBuffers                 = 44;
+constexpr int kListSlot_SOSetTargets                       = 45;
+constexpr int kListSlot_OMSetRenderTargets                 = 46;
+constexpr int kListSlot_ClearDepthStencilView              = 47;
+constexpr int kListSlot_ClearRenderTargetView              = 48;
+constexpr int kListSlot_ClearUnorderedAccessViewUint       = 49;
+constexpr int kListSlot_ClearUnorderedAccessViewFloat      = 50;
+constexpr int kListSlot_BeginQuery                         = 52;
+constexpr int kListSlot_EndQuery                           = 53;
+constexpr int kListSlot_ResolveQueryData                   = 54;
+constexpr int kListSlot_ExecuteIndirect                    = 59;
+constexpr int kListSlot_BeginRenderPass                    = 68; // ID3D12GraphicsCommandList4
+constexpr int kListSlot_DispatchMesh                       = 79; // ID3D12GraphicsCommandList6
+
+// ---- DXGI -----------------------------------------------------------------
+constexpr int kFactorySlot_EnumAdapters                  = 7;
+constexpr int kFactorySlot_CreateSwapChain               = 10;
+constexpr int kFactorySlot_EnumAdapters1                 = 12; // IDXGIFactory1
+constexpr int kFactorySlot_CreateSwapChainForHwnd        = 15; // IDXGIFactory2
+constexpr int kFactorySlot_CreateSwapChainForCoreWindow  = 16; // IDXGIFactory2
+constexpr int kFactorySlot_CreateSwapChainForComposition = 24; // IDXGIFactory2
+constexpr int kFactorySlot_EnumAdapterByLuid             = 26; // IDXGIFactory4
+constexpr int kFactorySlot_EnumAdapterByGpuPreference    = 29; // IDXGIFactory6
+constexpr int kAdapterSlot_QueryVideoMemoryInfo          = 14; // IDXGIAdapter3
+constexpr int kAdapterSlot_SetVideoMemoryReservation     = 15; // IDXGIAdapter3
+constexpr int kSwapChainSlot_GetBuffer                   = 9;
+constexpr int kSwapChainSlot_ResizeBuffers               = 13;
+constexpr int kSwapChainSlot_ResizeBuffers1              = 39; // IDXGISwapChain3
 
 // Entries copied from an original vtable into its shadow, so that methods of
 // derived interfaces (ID3D12Device14, ID3D12GraphicsCommandList10, ...) that

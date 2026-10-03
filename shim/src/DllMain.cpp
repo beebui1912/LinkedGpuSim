@@ -56,10 +56,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ReasonForCall, LPVOID /*lpReserved*
                 // Return TRUE anyway - failing DllMain would tear down the
                 // child process, which is worse than a passive shim.
             }
-            if (Cfg.VirtualAdapters && !D3D12Sim::InstallDXGIHooks())
+            // Always: adapters answer per node and swap chain buffers get their node; the virtual
+            // per-node adapters inside are opt-in (Cfg.VirtualAdapters)
+            if (!D3D12Sim::InstallDXGIHooks())
             {
-                D3D12Sim::LogError("D3D12Sim shim: DXGI hook installation failed; GpuInfoPanel "
-                                   "will still show the real adapter list.");
+                D3D12Sim::LogError("D3D12Sim shim: DXGI hook installation failed; adapters and swap "
+                                   "chains are not simulated per node.");
             }
             break;
         }

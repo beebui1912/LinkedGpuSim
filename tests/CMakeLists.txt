@@ -1,4 +1,4 @@
-﻿#
+#
 #  Copyright 2019-2026 Diligent Graphics LLC
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,6 +18,7 @@ if(TARGET D3D12Sim)
         FOLDER                           "DiligentGpuSimulation/tests")
     add_dependencies(D3D12SimTest D3D12Sim)
     add_test(NAME D3D12SimTest COMMAND D3D12SimTest)
+    add_test(NAME D3D12SimTest_Tier2 COMMAND D3D12SimTest --tier 2)
 endif()
 
 if(TARGET VkLayer_DiligentGpuSim AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/VkSimTest.cpp")

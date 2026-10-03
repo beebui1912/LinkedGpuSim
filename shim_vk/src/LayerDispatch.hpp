@@ -21,6 +21,8 @@
 
 #include <vulkan/vulkan.h>
 
+#include "LayerMemoryModel.hpp"
+
 namespace VkSim
 {
 
@@ -126,10 +128,66 @@ struct DeviceData
     PFN_vkQueuePresentKHR                  QueuePresentKHR                  = nullptr;
     PFN_vkAcquireNextImage2KHR             AcquireNextImage2KHR             = nullptr;
 
-    // State for validation
-    std::mutex                                   Mutex;
-    std::unordered_map<VkCommandBuffer, uint32_t> BeginMasks;     // device mask at vkBeginCommandBuffer
-    std::unordered_map<VkDeviceMemory, bool>      MultiInstance;  // allocations with several instances
+    PFN_vkCreateBuffer                     CreateBuffer                     = nullptr;
+    PFN_vkDestroyBuffer                    DestroyBuffer                    = nullptr;
+    PFN_vkCreateImage                      CreateImage                      = nullptr;
+    PFN_vkDestroyImage                     DestroyImage                     = nullptr;
+    PFN_vkBindBufferMemory                 BindBufferMemory                 = nullptr;
+    PFN_vkBindImageMemory                  BindImageMemory                  = nullptr;
+    PFN_vkCreateImageView                  CreateImageView                  = nullptr;
+    PFN_vkDestroyImageView                 DestroyImageView                 = nullptr;
+    PFN_vkCreateRenderPass                 CreateRenderPass                 = nullptr;
+    PFN_vkCreateRenderPass2                CreateRenderPass2                = nullptr;
+    PFN_vkCreateRenderPass2                CreateRenderPass2KHR             = nullptr;
+    PFN_vkDestroyRenderPass                DestroyRenderPass                = nullptr;
+    PFN_vkCreateFramebuffer                CreateFramebuffer                = nullptr;
+    PFN_vkDestroyFramebuffer               DestroyFramebuffer               = nullptr;
+    PFN_vkAllocateCommandBuffers           AllocateCommandBuffers           = nullptr;
+    PFN_vkDestroyCommandPool               DestroyCommandPool               = nullptr;
+    PFN_vkCmdExecuteCommands               CmdExecuteCommands               = nullptr;
+    PFN_vkCmdCopyBuffer                    CmdCopyBuffer                    = nullptr;
+    PFN_vkCmdCopyImage                     CmdCopyImage                     = nullptr;
+    PFN_vkCmdCopyBufferToImage             CmdCopyBufferToImage             = nullptr;
+    PFN_vkCmdCopyImageToBuffer             CmdCopyImageToBuffer             = nullptr;
+    PFN_vkCmdCopyBuffer2                   CmdCopyBuffer2                   = nullptr;
+    PFN_vkCmdCopyImage2                    CmdCopyImage2                    = nullptr;
+    PFN_vkCmdCopyBufferToImage2            CmdCopyBufferToImage2            = nullptr;
+    PFN_vkCmdCopyImageToBuffer2            CmdCopyImageToBuffer2            = nullptr;
+    PFN_vkCmdCopyBuffer2                   CmdCopyBuffer2KHR                = nullptr;
+    PFN_vkCmdCopyImage2                    CmdCopyImage2KHR                 = nullptr;
+    PFN_vkCmdCopyBufferToImage2            CmdCopyBufferToImage2KHR         = nullptr;
+    PFN_vkCmdCopyImageToBuffer2            CmdCopyImageToBuffer2KHR         = nullptr;
+    PFN_vkCmdBlitImage                     CmdBlitImage                     = nullptr;
+    PFN_vkCmdBlitImage2                    CmdBlitImage2                    = nullptr;
+    PFN_vkCmdBlitImage2                    CmdBlitImage2KHR                 = nullptr;
+    PFN_vkCmdResolveImage                  CmdResolveImage                  = nullptr;
+    PFN_vkCmdResolveImage2                 CmdResolveImage2                 = nullptr;
+    PFN_vkCmdResolveImage2                 CmdResolveImage2KHR              = nullptr;
+    PFN_vkCmdClearColorImage               CmdClearColorImage               = nullptr;
+    PFN_vkCmdClearDepthStencilImage        CmdClearDepthStencilImage        = nullptr;
+    PFN_vkCmdFillBuffer                    CmdFillBuffer                    = nullptr;
+    PFN_vkCmdUpdateBuffer                  CmdUpdateBuffer                  = nullptr;
+    PFN_vkCmdCopyQueryPoolResults          CmdCopyQueryPoolResults          = nullptr;
+    PFN_vkCmdBindVertexBuffers             CmdBindVertexBuffers             = nullptr;
+    PFN_vkCmdBindIndexBuffer               CmdBindIndexBuffer               = nullptr;
+    PFN_vkCmdDraw                          CmdDraw                          = nullptr;
+    PFN_vkCmdDrawIndexed                   CmdDrawIndexed                   = nullptr;
+    PFN_vkCmdDrawIndirect                  CmdDrawIndirect                  = nullptr;
+    PFN_vkCmdDrawIndexedIndirect           CmdDrawIndexedIndirect           = nullptr;
+    PFN_vkGetDeviceGroupPresentCapabilitiesKHR GetDeviceGroupPresentCapabilitiesKHR = nullptr;
+    PFN_vkGetDeviceGroupSurfacePresentModesKHR GetDeviceGroupSurfacePresentModesKHR = nullptr;
+    PFN_vkCreateSwapchainKHR               CreateSwapchainKHR               = nullptr;
+    PFN_vkDestroySwapchainKHR              DestroySwapchainKHR              = nullptr;
+
+    // Per memory heap: device local (multi-instance in a group of several devices)
+    std::vector<bool> DeviceLocalHeap;
+    std::vector<uint32_t> TypeHeap; // memory type -> heap
+
+    // State for validation and the memory-instance model (LayerMemoryModel.hpp)
+    std::mutex                                    Mutex;
+    std::unordered_map<VkCommandBuffer, uint32_t> BeginMasks; // device mask at vkBeginCommandBuffer
+    std::unordered_map<VkDeviceMemory, bool>      MultiInstance; // allocations with several instances
+    std::unique_ptr<MemoryModel>                  Model;
 };
 
 // Loader dispatch key of a dispatchable handle

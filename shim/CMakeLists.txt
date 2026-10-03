@@ -24,6 +24,8 @@ set(D3D12SIM_SOURCES
     src/D3D12CommandWrappers.cpp
     src/D3D12CommandWrappers.hpp
     src/D3D12VtableCheck.cpp
+    src/D3D12Tracking.cpp
+    src/D3D12Tracking.hpp
     src/NodeMasks.cpp
     src/NodeMasks.hpp
     src/VtableShadow.cpp

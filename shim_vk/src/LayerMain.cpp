@@ -28,6 +28,7 @@
 //  and, when > 1, sets AdapterInfo.NodeCount = NodeCount + enables linked
 //  multi-GPU with N views.  That gets Tutorial31 into the split-strip path.
 
+#include <algorithm>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -275,28 +276,40 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkDestroyInstance(VkInstance Instance, const Vk
 // Physical device enumeration - both single-list and group flavours
 // ---------------------------------------------------------------------------
 
+VkPhysicalDevice GetHost(VkInstance Instance, InstanceData& Inst);
+
+// Every device of a real group is also a physical device of its own (each GPU
+// can be used alone), so the simulated devices 1..N-1 follow the host here
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkEnumeratePhysicalDevices(
     VkInstance                          Instance,
     uint32_t*                           pPhysicalDeviceCount,
     VkPhysicalDevice*                   pPhysicalDevices)
 {
     InstanceData* pInst = FindInstance(Instance);
-    if (pInst == nullptr || pInst->EnumeratePhysicalDevices == nullptr)
+    if (pInst == nullptr || pInst->EnumeratePhysicalDevices == nullptr || pPhysicalDeviceCount == nullptr)
         return VK_ERROR_INITIALIZATION_FAILED;
 
-    // Forward as-is; we return REAL handles (not wrapped) from this path.
-    // Diligent's linked-multi-GPU code path uses EnumeratePhysicalDeviceGroups
-    // where our wrappers show up.
-    const VkResult r = pInst->EnumeratePhysicalDevices(Instance, pPhysicalDeviceCount, pPhysicalDevices);
-    if (r == VK_SUCCESS && pPhysicalDevices != nullptr && pPhysicalDeviceCount != nullptr)
+    const VkPhysicalDevice        Host = GetHost(Instance, *pInst);
+    std::vector<VkPhysicalDevice> All;
     {
         std::lock_guard<std::mutex> Lock(g_Mutex);
-        auto& Vec = g_RealPhysicalDevices[Instance];
-        Vec.assign(pPhysicalDevices, pPhysicalDevices + *pPhysicalDeviceCount);
+        for (VkPhysicalDevice Pd : g_RealPhysicalDevices[Instance])
+        {
+            All.push_back(Pd);
+            if (Pd == Host)
+                All.insert(All.end(), pInst->NodeWrappers.begin(), pInst->NodeWrappers.end());
+        }
     }
-    return r;
+    if (pPhysicalDevices == nullptr)
+    {
+        *pPhysicalDeviceCount = static_cast<uint32_t>(All.size());
+        return VK_SUCCESS;
+    }
+    const uint32_t Written = (std::min)(*pPhysicalDeviceCount, static_cast<uint32_t>(All.size()));
+    std::copy(All.begin(), All.begin() + Written, pPhysicalDevices);
+    *pPhysicalDeviceCount = Written;
+    return Written < All.size() ? VK_INCOMPLETE : VK_SUCCESS;
 }
-
 
 // The physical device the simulated group is built on: the adapter whose LUID
 // SimulationApp passed (the one chosen as host), else the first one.
@@ -391,7 +404,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkEnumeratePhysicalDeviceGroups(
             for (size_t k = 0; k < pInst->NodeWrappers.size(); ++k)
                 G.physicalDevices[k + 1] = pInst->NodeWrappers[k];
             G.physicalDeviceCount = static_cast<uint32_t>(pInst->NodeWrappers.size() + 1);
-            G.subsetAllocation    = VK_FALSE;
+            G.subsetAllocation    = GetConfig().SubsetAllocation ? VK_TRUE : VK_FALSE;
         }
     }
 
@@ -515,8 +528,14 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreateDevice(
             VkPhysicalDeviceMemoryProperties Mem{};
             pInst->GetPhysicalDeviceMemoryProperties(RealPhys, &Mem);
             for (uint32_t i = 0; i < Mem.memoryTypeCount; ++i)
+            {
                 dd->MultiInstanceType.push_back((Mem.memoryHeaps[Mem.memoryTypes[i].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0);
+                dd->TypeHeap.push_back(Mem.memoryTypes[i].heapIndex);
+            }
+            for (uint32_t h = 0; h < Mem.memoryHeapCount; ++h)
+                dd->DeviceLocalHeap.push_back((Mem.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0);
         }
+        dd->Model = std::make_unique<MemoryModel>(); // memory instances of the group (LayerMemoryModel.hpp)
     }
     {
         std::lock_guard<std::mutex> Lock(g_Mutex);
@@ -550,6 +569,8 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkDestroyDevice(VkDevice Device, const VkAlloca
 // vkGetPhysicalDeviceProperties[2] - unwrap + append "[Simulated Node k]"
 // ---------------------------------------------------------------------------
 
+static bool IsSimulatedGroupMember(VkPhysicalDevice Pd, const InstanceData& Inst);
+
 static void ApplyNodeSuffixToDeviceName(char DeviceName[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE],
                                         uint32_t NodeIndex)
 {
@@ -579,7 +600,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_GetPhysicalDeviceProperties(
     if (Inst == nullptr || Inst->GetPhysicalDeviceProperties == nullptr) return;
 
     Inst->GetPhysicalDeviceProperties(Real, pProperties);
-    if (w != nullptr && pProperties != nullptr)
+    if (w != nullptr && pProperties != nullptr && GetConfig().VirtualIdentities)
         ApplyNodeSuffixToDeviceName(pProperties->deviceName, w->NodeIndex);
 }
 
@@ -597,8 +618,35 @@ VKAPI_ATTR void VKAPI_CALL Layer_GetPhysicalDeviceProperties2(
         Inst->GetPhysicalDeviceProperties2KHR(Real, pProperties);
     else return;
 
-    if (w != nullptr && pProperties != nullptr)
+    if (pProperties == nullptr)
+        return;
+    if (w != nullptr && GetConfig().VirtualIdentities)
         ApplyNodeSuffixToDeviceName(pProperties->properties.deviceName, w->NodeIndex);
+    // A linked adapter: the devices share the adapter LUID and tell their node by deviceNodeMask;
+    // as separate GPUs they have distinct UUIDs
+    if (IsSimulatedGroupMember(PhysicalDevice, *Inst))
+    {
+        const uint32_t NodeIndex = w != nullptr ? w->NodeIndex : 0;
+        auto           PatchIds  = [&](uint8_t* pUuid, uint32_t& NodeMask, VkBool32 LuidValid) {
+            if (LuidValid)
+                NodeMask = 1u << NodeIndex;
+            if (NodeIndex != 0)
+                pUuid[VK_UUID_SIZE - 1] ^= static_cast<uint8_t>(0x80u | NodeIndex);
+        };
+        for (auto* p = static_cast<VkBaseOutStructure*>(pProperties->pNext); p != nullptr; p = p->pNext)
+        {
+            if (p->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES)
+            {
+                auto* pId = reinterpret_cast<VkPhysicalDeviceIDProperties*>(p);
+                PatchIds(pId->deviceUUID, pId->deviceNodeMask, pId->deviceLUIDValid);
+            }
+            else if (p->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES)
+            {
+                auto* p11 = reinterpret_cast<VkPhysicalDeviceVulkan11Properties*>(p);
+                PatchIds(p11->deviceUUID, p11->deviceNodeMask, p11->deviceLUIDValid);
+            }
+        }
+    }
 }
 
 VKAPI_ATTR void VKAPI_CALL Layer_GetPhysicalDeviceProperties2KHR(
@@ -649,7 +697,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_GetPhysicalDeviceMemoryProperties(
     if (Inst == nullptr || Inst->GetPhysicalDeviceMemoryProperties == nullptr) return;
 
     Inst->GetPhysicalDeviceMemoryProperties(Real, pMem);
-    if (w != nullptr) SplitMemoryHeapSizes(pMem, w->NodeCount);
+    if (w != nullptr && GetConfig().VirtualIdentities) SplitMemoryHeapSizes(pMem, w->NodeCount);
     if (IsSimulatedGroupMember(PhysicalDevice, *Inst)) MarkMultiInstanceHeaps(pMem);
 }
 
@@ -667,7 +715,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_GetPhysicalDeviceMemoryProperties2(
         Inst->GetPhysicalDeviceMemoryProperties2KHR(Real, pMem);
     else return;
 
-    if (w != nullptr && pMem != nullptr)
+    if (w != nullptr && pMem != nullptr && GetConfig().VirtualIdentities)
         SplitMemoryHeapSizes(&pMem->memoryProperties, w->NodeCount);
     if (pMem != nullptr && IsSimulatedGroupMember(PhysicalDevice, *Inst))
         MarkMultiInstanceHeaps(&pMem->memoryProperties);

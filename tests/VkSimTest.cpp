@@ -136,6 +136,8 @@ void TestGroupDevice(Context& C)
     VkPeerMemoryFeatureFlags Peer = 0;
     vkGetDeviceGroupPeerMemoryFeatures(C.Device, 0, 0, 1, &Peer);
     CHECK((Peer & VK_PEER_MEMORY_FEATURE_COPY_DST_BIT) != 0);
+    CHECK((Peer & VK_PEER_MEMORY_FEATURE_COPY_SRC_BIT) != 0);
+    CHECK((Peer & VK_PEER_MEMORY_FEATURE_GENERIC_SRC_BIT) == 0); // no generic reads of another device's memory
     CHECK(ExpectLayerErrors(1, [&] { vkGetDeviceGroupPeerMemoryFeatures(C.Device, 0, 0, 2, &Peer); }));
 
     std::printf("Work on device 1 of the group\n");
@@ -253,6 +255,166 @@ void TestGroupDevice(Context& C)
         vkFreeMemory(C.Device, LocalMem, nullptr);
 }
 
+struct Resource
+{
+    VkBuffer       Buffer = VK_NULL_HANDLE;
+    VkImage        Image  = VK_NULL_HANDLE;
+    VkDeviceMemory Memory = VK_NULL_HANDLE;
+};
+
+// A device-local buffer or 64x64 RGBA8 image, its memory allocated for DeviceMask (0: every
+// device), bound with DeviceIndices (null: each device its own instance)
+Resource CreateResource(const Context& C, bool Image, uint32_t DeviceMask, const uint32_t* pDeviceIndices = nullptr)
+{
+    Resource             R;
+    VkMemoryRequirements Req{};
+    if (Image)
+    {
+        VkImageCreateInfo ICI{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ICI.imageType     = VK_IMAGE_TYPE_2D;
+        ICI.format        = VK_FORMAT_R8G8B8A8_UNORM;
+        ICI.extent        = {64, 64, 1};
+        ICI.mipLevels     = 1;
+        ICI.arrayLayers   = 1;
+        ICI.samples       = VK_SAMPLE_COUNT_1_BIT;
+        ICI.tiling        = VK_IMAGE_TILING_OPTIMAL;
+        ICI.usage         = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        ICI.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        vkCreateImage(C.Device, &ICI, nullptr, &R.Image);
+        vkGetImageMemoryRequirements(C.Device, R.Image, &Req);
+    }
+    else
+    {
+        VkBufferCreateInfo BCI{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        BCI.size  = 64 * 1024;
+        BCI.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        vkCreateBuffer(C.Device, &BCI, nullptr, &R.Buffer);
+        vkGetBufferMemoryRequirements(C.Device, R.Buffer, &Req);
+    }
+    const int Type = FindMemoryType(C, Req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, true);
+    R.Memory       = Type >= 0 ? Allocate(C, Type, Req.size, DeviceMask) : VK_NULL_HANDLE;
+    if (Image)
+    {
+        VkBindImageMemoryDeviceGroupInfo Group{VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_DEVICE_GROUP_INFO, nullptr, pDeviceIndices != nullptr ? 2u : 0u, pDeviceIndices};
+        VkBindImageMemoryInfo            Bind{VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO, &Group, R.Image, R.Memory, 0};
+        vkBindImageMemory2(C.Device, 1, &Bind);
+    }
+    else
+    {
+        VkBindBufferMemoryDeviceGroupInfo Group{VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_DEVICE_GROUP_INFO, nullptr, pDeviceIndices != nullptr ? 2u : 0u, pDeviceIndices};
+        VkBindBufferMemoryInfo            Bind{VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO, &Group, R.Buffer, R.Memory, 0};
+        vkBindBufferMemory2(C.Device, 1, &Bind);
+    }
+    return R;
+}
+
+void Destroy(const Context& C, Resource& R)
+{
+    if (R.Buffer != VK_NULL_HANDLE)
+        vkDestroyBuffer(C.Device, R.Buffer, nullptr);
+    if (R.Image != VK_NULL_HANDLE)
+        vkDestroyImage(C.Device, R.Image, nullptr);
+    if (R.Memory != VK_NULL_HANDLE)
+        vkFreeMemory(C.Device, R.Memory, nullptr);
+    R = Resource{};
+}
+
+// Records Fn into a command buffer begun for BeginMask, submits it for SubmitMask and waits
+template <typename F>
+void Run(const Context& C, uint32_t BeginMask, uint32_t SubmitMask, F&& Fn)
+{
+    VkCommandBuffer Cmd = BeginCommandBuffer(C, BeginMask);
+    Fn(Cmd);
+    vkEndCommandBuffer(Cmd);
+    VkDeviceGroupSubmitInfo Group{VK_STRUCTURE_TYPE_DEVICE_GROUP_SUBMIT_INFO, nullptr, 0, nullptr, 1, &SubmitMask, 0, nullptr};
+    VkSubmitInfo            Submit{VK_STRUCTURE_TYPE_SUBMIT_INFO, &Group};
+    Submit.commandBufferCount = 1;
+    Submit.pCommandBuffers    = &Cmd;
+    vkQueueSubmit(C.Queue, 1, &Submit, VK_NULL_HANDLE);
+    vkQueueWaitIdle(C.Queue);
+    vkFreeCommandBuffers(C.Device, C.Pool, 1, &Cmd);
+}
+
+void ToGeneral(VkCommandBuffer Cmd, VkImage Image)
+{
+    VkImageMemoryBarrier Barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    Barrier.srcAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
+    Barrier.dstAccessMask       = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    Barrier.oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED;
+    Barrier.newLayout           = VK_IMAGE_LAYOUT_GENERAL;
+    Barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    Barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    Barrier.image               = Image;
+    Barrier.subresourceRange    = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(Cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &Barrier);
+}
+
+// Each device of a real group has its own instance of device-local memory
+void TestMemoryInstances(Context& C)
+{
+    std::printf("Memory instances: data written on one device is not on the other\n");
+    Resource A = CreateResource(C, false, 0);
+    Resource B = CreateResource(C, false, 0);
+    CHECK(A.Memory != VK_NULL_HANDLE && B.Memory != VK_NULL_HANDLE);
+    if (A.Memory == VK_NULL_HANDLE || B.Memory == VK_NULL_HANDLE)
+        return;
+    const VkBufferCopy Whole{0, 0, 64 * 1024};
+
+    // Written on device 0 only, read on device 1: device 1 reads its own, old instance
+    Run(C, 0x1, 0x1, [&](VkCommandBuffer Cmd) { vkCmdFillBuffer(Cmd, A.Buffer, 0, VK_WHOLE_SIZE, 1u); });
+    CHECK(ExpectLayerErrors(1, [&] { Run(C, 0x2, 0x2, [&](VkCommandBuffer Cmd) { vkCmdCopyBuffer(Cmd, A.Buffer, B.Buffer, 1, &Whole); }); }));
+    // The same read on device 0 is fine
+    CHECK(ExpectLayerErrors(0, [&] { Run(C, 0x1, 0x1, [&](VkCommandBuffer Cmd) { vkCmdCopyBuffer(Cmd, A.Buffer, B.Buffer, 1, &Whole); }); }));
+    // Written on both devices (device mask 0x3): every instance has the data
+    Run(C, 0x3, 0x3, [&](VkCommandBuffer Cmd) { vkCmdFillBuffer(Cmd, A.Buffer, 0, VK_WHOLE_SIZE, 2u); });
+    CHECK(ExpectLayerErrors(0, [&] { Run(C, 0x2, 0x2, [&](VkCommandBuffer Cmd) { vkCmdCopyBuffer(Cmd, A.Buffer, B.Buffer, 1, &Whole); }); }));
+    // vkCmdSetDeviceMask narrows the following commands to device 0
+    Run(C, 0x3, 0x3, [&](VkCommandBuffer Cmd) {
+        vkCmdSetDeviceMask(Cmd, 0x1);
+        vkCmdFillBuffer(Cmd, A.Buffer, 0, VK_WHOLE_SIZE, 3u);
+    });
+    CHECK(ExpectLayerErrors(1, [&] { Run(C, 0x2, 0x2, [&](VkCommandBuffer Cmd) { vkCmdCopyBuffer(Cmd, A.Buffer, B.Buffer, 1, &Whole); }); }));
+
+    std::printf("Peer memory: device 1 bound to device 0's instance\n");
+    const uint32_t Peer[2] = {0, 0};
+    Resource       P       = CreateResource(C, false, 0, Peer);
+    Run(C, 0x1, 0x1, [&](VkCommandBuffer Cmd) { vkCmdFillBuffer(Cmd, P.Buffer, 0, VK_WHOLE_SIZE, 4u); });
+    // Device 1 copies from device 0's instance: peer copy source is supported, and the data is there
+    CHECK(ExpectLayerErrors(0, [&] { Run(C, 0x2, 0x2, [&](VkCommandBuffer Cmd) { vkCmdCopyBuffer(Cmd, P.Buffer, B.Buffer, 1, &Whole); }); }));
+
+    std::printf("Memory allocated for device 0 only\n");
+    Resource Only0 = CreateResource(C, false, 0x1);
+    CHECK(ExpectLayerErrors(1, [&] { Run(C, 0x2, 0x2, [&](VkCommandBuffer Cmd) { vkCmdFillBuffer(Cmd, Only0.Buffer, 0, VK_WHOLE_SIZE, 5u); }); }));
+
+    std::printf("Image regions written on different devices\n");
+    Resource Img = CreateResource(C, true, 0);
+    Resource Dst = CreateResource(C, true, 0);
+    CHECK(Img.Memory != VK_NULL_HANDLE && Dst.Memory != VK_NULL_HANDLE);
+    if (Img.Memory != VK_NULL_HANDLE && Dst.Memory != VK_NULL_HANDLE)
+    {
+        Run(C, 0x3, 0x3, [&](VkCommandBuffer Cmd) {
+            ToGeneral(Cmd, Img.Image);
+            ToGeneral(Cmd, Dst.Image);
+        });
+        const VkClearColorValue       Color{};
+        const VkImageSubresourceRange Left{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        // Left half rendered on device 0, right half on device 1 (as a split frame would)
+        VkImageCopy LeftHalf{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {32, 64, 1}};
+        VkImageCopy RightHalf{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {32, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {32, 0, 0}, {32, 64, 1}};
+        Run(C, 0x3, 0x3, [&](VkCommandBuffer Cmd) { vkCmdClearColorImage(Cmd, Dst.Image, VK_IMAGE_LAYOUT_GENERAL, &Color, 1, &Left); });
+        Run(C, 0x1, 0x1, [&](VkCommandBuffer Cmd) { vkCmdCopyImage(Cmd, Dst.Image, VK_IMAGE_LAYOUT_GENERAL, Img.Image, VK_IMAGE_LAYOUT_GENERAL, 1, &LeftHalf); });
+        Run(C, 0x2, 0x2, [&](VkCommandBuffer Cmd) { vkCmdCopyImage(Cmd, Dst.Image, VK_IMAGE_LAYOUT_GENERAL, Img.Image, VK_IMAGE_LAYOUT_GENERAL, 1, &RightHalf); });
+        // Device 1 reads its own half: fine; the other half only device 0 has
+        CHECK(ExpectLayerErrors(0, [&] { Run(C, 0x2, 0x2, [&](VkCommandBuffer Cmd) { vkCmdCopyImage(Cmd, Img.Image, VK_IMAGE_LAYOUT_GENERAL, Dst.Image, VK_IMAGE_LAYOUT_GENERAL, 1, &RightHalf); }); }));
+        CHECK(ExpectLayerErrors(1, [&] { Run(C, 0x2, 0x2, [&](VkCommandBuffer Cmd) { vkCmdCopyImage(Cmd, Img.Image, VK_IMAGE_LAYOUT_GENERAL, Dst.Image, VK_IMAGE_LAYOUT_GENERAL, 1, &LeftHalf); }); }));
+        // A clear on every device makes the whole image current everywhere
+        Run(C, 0x3, 0x3, [&](VkCommandBuffer Cmd) { vkCmdClearColorImage(Cmd, Img.Image, VK_IMAGE_LAYOUT_GENERAL, &Color, 1, &Left); });
+        CHECK(ExpectLayerErrors(0, [&] { Run(C, 0x2, 0x2, [&](VkCommandBuffer Cmd) { vkCmdCopyImage(Cmd, Img.Image, VK_IMAGE_LAYOUT_GENERAL, Dst.Image, VK_IMAGE_LAYOUT_GENERAL, 1, &LeftHalf); }); }));
+    }
+    for (Resource* pR : {&A, &B, &P, &Only0, &Img, &Dst})
+        Destroy(C, *pR);
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -297,9 +459,9 @@ int main(int argc, char** argv)
 
     const bool              Khronos = HasLayer("VK_LAYER_KHRONOS_validation");
     const char*             Layers[] = {"VK_LAYER_KHRONOS_validation"};
-    const char*             Exts[]   = {VK_EXT_DEBUG_UTILS_EXTENSION_NAME};
+    const char*             Exts[]   = {VK_KHR_SURFACE_EXTENSION_NAME, VK_EXT_DEBUG_UTILS_EXTENSION_NAME};
     VkApplicationInfo       App{VK_STRUCTURE_TYPE_APPLICATION_INFO, nullptr, "VkSimTest", 1, nullptr, 0, VK_API_VERSION_1_3};
-    VkInstanceCreateInfo    ICI{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, nullptr, 0, &App, Khronos ? 1u : 0u, Layers, Khronos ? 1u : 0u, Exts};
+    VkInstanceCreateInfo    ICI{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, nullptr, 0, &App, Khronos ? 1u : 0u, Layers, Khronos ? 2u : 1u, Exts};
     VkInstance              Instance = VK_NULL_HANDLE;
     if (vkCreateInstance(&ICI, nullptr, &Instance) != VK_SUCCESS)
     {
@@ -333,7 +495,7 @@ int main(int argc, char** argv)
     vkEnumeratePhysicalDeviceGroups(Instance, &GroupCount, nullptr);
     std::vector<VkPhysicalDeviceGroupProperties> Groups(GroupCount, VkPhysicalDeviceGroupProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GROUP_PROPERTIES});
     vkEnumeratePhysicalDeviceGroups(Instance, &GroupCount, Groups.data());
-    CHECK(GroupCount == PdCount); // every physical device is in exactly one group
+    CHECK(GroupCount + 1 == PdCount); // every physical device is in exactly one group; the simulated group has two
     const VkPhysicalDeviceGroupProperties* pSimGroup = nullptr;
     for (const auto& G : Groups)
         if (G.physicalDeviceCount == 2)
@@ -347,6 +509,31 @@ int main(int argc, char** argv)
         for (uint32_t d = 0; d < Groups[g].physicalDeviceCount; ++d)
             Stable = Stable && Groups[g].physicalDevices[d] == Again[g].physicalDevices[d];
     CHECK(Stable);
+
+    std::printf("The devices of the group are physical devices of their own\n");
+    std::vector<VkPhysicalDevice> Physical(PdCount);
+    vkEnumeratePhysicalDevices(Instance, &PdCount, Physical.data());
+    if (pSimGroup != nullptr)
+    {
+        uint32_t Listed = 0;
+        for (VkPhysicalDevice Pd : Physical)
+            Listed += (Pd == pSimGroup->physicalDevices[0] || Pd == pSimGroup->physicalDevices[1]) ? 1 : 0;
+        CHECK(Listed == 2);
+        VkPhysicalDeviceIDProperties Id[2]{{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES}, {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES}};
+        VkPhysicalDeviceProperties2  P2[2]{{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &Id[0]}, {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &Id[1]}};
+        VkPhysicalDeviceMemoryProperties Mem[2]{};
+        for (int k = 0; k < 2; ++k)
+        {
+            vkGetPhysicalDeviceProperties2(pSimGroup->physicalDevices[k], &P2[k]);
+            vkGetPhysicalDeviceMemoryProperties(pSimGroup->physicalDevices[k], &Mem[k]);
+        }
+        // One linked adapter: same LUID, the node in deviceNodeMask; separate GPUs: distinct UUIDs; identical otherwise
+        CHECK(Id[0].deviceLUIDValid && Id[1].deviceLUIDValid && std::memcmp(Id[0].deviceLUID, Id[1].deviceLUID, VK_LUID_SIZE) == 0);
+        CHECK(Id[0].deviceNodeMask == 0x1 && Id[1].deviceNodeMask == 0x2);
+        CHECK(std::memcmp(Id[0].deviceUUID, Id[1].deviceUUID, VK_UUID_SIZE) != 0);
+        CHECK(std::strcmp(P2[0].properties.deviceName, P2[1].properties.deviceName) == 0);
+        CHECK(Mem[0].memoryHeapCount == Mem[1].memoryHeapCount && Mem[0].memoryHeaps[0].size == Mem[1].memoryHeaps[0].size);
+    }
 
     if (pSimGroup != nullptr)
     {
@@ -386,7 +573,8 @@ int main(int argc, char** argv)
         const float                   Priority = 1.0f;
         VkDeviceQueueCreateInfo       QCI{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, nullptr, 0, C.QueueFamily, 1, &Priority};
         VkDeviceGroupDeviceCreateInfo GroupCI{VK_STRUCTURE_TYPE_DEVICE_GROUP_DEVICE_CREATE_INFO, &Enable13, pSimGroup->physicalDeviceCount, pSimGroup->physicalDevices};
-        VkDeviceCreateInfo            DCI{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &GroupCI, 0, 1, &QCI};
+        const char*                   DevExts[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+        VkDeviceCreateInfo            DCI{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &GroupCI, 0, 1, &QCI, 0, nullptr, 1, DevExts};
         std::printf("Device of the simulated group\n");
         CHECK(ExpectLayerErrors(0, [&] { CHECK(vkCreateDevice(C.Host, &DCI, nullptr, &C.Device) == VK_SUCCESS); }));
         CHECK(GroupCI.physicalDeviceCount == 2 && GroupCI.pPhysicalDevices == pSimGroup->physicalDevices); // restored
@@ -396,6 +584,17 @@ int main(int argc, char** argv)
             VkCommandPoolCreateInfo PCI{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, nullptr, 0, C.QueueFamily};
             vkCreateCommandPool(C.Device, &PCI, nullptr, &C.Pool);
             TestGroupDevice(C);
+            TestMemoryInstances(C);
+            std::printf("Presentation\n");
+            VkDeviceGroupPresentCapabilitiesKHR Caps{VK_STRUCTURE_TYPE_DEVICE_GROUP_PRESENT_CAPABILITIES_KHR};
+            auto pfnCaps = reinterpret_cast<PFN_vkGetDeviceGroupPresentCapabilitiesKHR>(vkGetDeviceProcAddr(C.Device, "vkGetDeviceGroupPresentCapabilitiesKHR"));
+            CHECK(pfnCaps != nullptr);
+            if (pfnCaps != nullptr)
+            {
+                CHECK(pfnCaps(C.Device, &Caps) == VK_SUCCESS);
+                CHECK(Caps.presentMask[0] == 0x3 && Caps.presentMask[1] == 0); // device 0 presents (also remotely); device 1 has no display
+                CHECK(Caps.modes == (VK_DEVICE_GROUP_PRESENT_MODE_LOCAL_BIT_KHR | VK_DEVICE_GROUP_PRESENT_MODE_REMOTE_BIT_KHR));
+            }
             vkDestroyCommandPool(C.Device, C.Pool, nullptr);
             vkDestroyDevice(C.Device, nullptr);
         }

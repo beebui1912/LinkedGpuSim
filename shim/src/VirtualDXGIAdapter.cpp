@@ -274,27 +274,15 @@ void STDMETHODCALLTYPE VirtualDXGIAdapter::UnregisterHardwareContentProtectionTe
     if (m_pReal3) m_pReal3->UnregisterHardwareContentProtectionTeardownStatus(dwCookie);
 }
 
+// The real host adapter is wrapped by DXGIFactoryWrapper and answers per node,
+// so each virtual adapter forwards to its own node
 HRESULT STDMETHODCALLTYPE VirtualDXGIAdapter::QueryVideoMemoryInfo(
     UINT                            /*NodeIndex*/,
     DXGI_MEMORY_SEGMENT_GROUP       MemorySegmentGroup,
     DXGI_QUERY_VIDEO_MEMORY_INFO*   pVideoMemoryInfo)
 {
     if (!m_pReal3 || pVideoMemoryInfo == nullptr) return E_NOINTERFACE;
-
-    // On the real single-node adapter the only valid NodeIndex is 0.
-    const HRESULT hr = m_pReal3->QueryVideoMemoryInfo(0, MemorySegmentGroup, pVideoMemoryInfo);
-    if (SUCCEEDED(hr))
-    {
-        pVideoMemoryInfo->Budget                = SplitU64(pVideoMemoryInfo->Budget);
-        pVideoMemoryInfo->CurrentUsage          = SplitU64(pVideoMemoryInfo->CurrentUsage);
-        pVideoMemoryInfo->AvailableForReservation = SplitU64(pVideoMemoryInfo->AvailableForReservation);
-        pVideoMemoryInfo->CurrentReservation    = SplitU64(pVideoMemoryInfo->CurrentReservation);
-        LogVerbose("VirtualDXGIAdapter[%u]::QueryVideoMemoryInfo -> budget=%llu used=%llu",
-                   m_NodeIndex,
-                   static_cast<unsigned long long>(pVideoMemoryInfo->Budget),
-                   static_cast<unsigned long long>(pVideoMemoryInfo->CurrentUsage));
-    }
-    return hr;
+    return m_pReal3->QueryVideoMemoryInfo(m_NodeIndex, MemorySegmentGroup, pVideoMemoryInfo);
 }
 
 HRESULT STDMETHODCALLTYPE VirtualDXGIAdapter::SetVideoMemoryReservation(
@@ -302,7 +290,7 @@ HRESULT STDMETHODCALLTYPE VirtualDXGIAdapter::SetVideoMemoryReservation(
     DXGI_MEMORY_SEGMENT_GROUP   MemorySegmentGroup,
     UINT64                      Reservation)
 {
-    return m_pReal3 ? m_pReal3->SetVideoMemoryReservation(0, MemorySegmentGroup, Reservation) : E_NOINTERFACE;
+    return m_pReal3 ? m_pReal3->SetVideoMemoryReservation(m_NodeIndex, MemorySegmentGroup, Reservation) : E_NOINTERFACE;
 }
 
 HRESULT STDMETHODCALLTYPE VirtualDXGIAdapter::RegisterVideoMemoryBudgetChangeNotificationEvent(HANDLE hEvent, DWORD* pdwCookie)

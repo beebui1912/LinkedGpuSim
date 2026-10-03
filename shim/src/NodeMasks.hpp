@@ -60,12 +60,35 @@ bool CheckHeapNodeMasks(const char* Api, UINT CreationNodeMask, UINT VisibleNode
 void ReportValidationError(const char* Fmt, ...);
 unsigned GetValidationErrorCount();
 
-// Simulated masks stored with D3D12 objects (absent for objects the shim did
-// not create, e.g. swap chain buffers: those are not checked)
+// Simulated node mask stored with a queue, command list, descriptor heap, query
+// heap (one node) or a pipeline state, root signature, command signature (node
+// set); 0 is stored as node 0
 void SetObjectNodeMask(IUnknown* pObject, UINT NodeMask);
 bool GetObjectNodeMask(IUnknown* pObject, UINT& NodeMask);
+
+// Masks of a resource or heap as created (normalized), kept in D3D12Tracking
 void SetResourceNodeMasks(IUnknown* pObject, UINT CreationNodeMask, UINT VisibleNodeMask);
-bool GetResourceNodeMasks(IUnknown* pObject, UINT& CreationNodeMask, UINT& VisibleNodeMask);
+bool GetResourceNodeMasks(const void* pObject, UINT& CreationNodeMask, UINT& VisibleNodeMask);
+
+// D3D12_CROSS_NODE_SHARING_TIER as a level: 0 none, 1 copies, 2 and 3 copies
+// and every other access. The access model of the simulator:
+//   * a resource may only be accessed by nodes in its VisibleNodeMask;
+//   * a node other than the creation node may access it with copy operations
+//     from tier 1, and through views, root arguments, vertex/index/stream-out
+//     buffers and as render target or depth buffer only from tier 2;
+//   * at tier 0 a resource is visible to its creation node only.
+UINT CrossNodeSharingLevel();
+
+enum ACCESS_KIND
+{
+    ACCESS_COPY,   // copy, resolve and query-resolve commands
+    ACCESS_SHADER, // views, root CBV/SRV/UAV, vertex/index/stream-out buffers, indirect arguments
+    ACCESS_TARGET, // render target, depth-stencil
+};
+
+// Reports an access by node ListNodeMask that linked hardware rejects. Resources
+// the shim did not see created are not checked. Returns false if reported.
+bool CheckResourceAccess(const char* Api, const char* Role, UINT ListNodeMask, const void* pResource, ACCESS_KIND Kind);
 
 } // namespace D3D12Sim
 
