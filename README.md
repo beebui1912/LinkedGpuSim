@@ -223,8 +223,8 @@ RenderEX registers both as CTest entries when it finds `SimulationApp.exe` (CMak
 
 `SimulationLauncher.exe` is a small dialog that fills in host adapter, node count, child executable,
 arguments and log file, and starts `SimulationApp.exe` in a new console. It does not offer the newer
-options (`--no-validation`, `--virtual-adapters`, `--cross-node-tier`); add them to the arguments
-field's command line by running SimulationApp directly.
+options (`--no-validation`, `--virtual-adapters`, `--cross-node-tier`); run SimulationApp directly
+for those.
 
 ## Limitations
 
