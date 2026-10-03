@@ -71,6 +71,7 @@ D3D12_COMMAND_QUEUE_DESC* STDMETHODCALLTYPE Hook_Queue_GetDesc(ID3D12CommandQueu
     UINT                      NodeMask = 0;
     if (pDesc != nullptr && GetObjectNodeMask(This, NodeMask))
         pDesc->NodeMask = NodeMask;
+    LogVerbose("ID3D12CommandQueue::GetDesc(%p) -> NodeMask 0x%X", This, pDesc != nullptr ? pDesc->NodeMask : 0u);
     return pDesc;
 }
 
@@ -145,6 +146,7 @@ void PatchListVtable(void** Slots, size_t NumSlots)
 void WrapCommandQueue(IUnknown* pQueue, unsigned NodeMask)
 {
     SetObjectNodeMask(pQueue, NodeMask);
+    LogVerbose("Command queue %p created for node mask 0x%X", pQueue, NodeMask);
     if (!g_Queues.Wrap(pQueue))
         LogError("Command queue %p could not be wrapped", pQueue);
 }
